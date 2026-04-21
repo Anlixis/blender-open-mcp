@@ -54,7 +54,7 @@ dev = [
 # MCP Server entry point
 blender-mcp = "blender_open_mcp.server:main"
 # MCP Client entry point
-blender-mcp-client = "blender_open_mcp.client_entry:main"
+blender-mcp-client = "client.client:main"
 
 [project.urls]
 Homepage = "https://github.com/dhakalnirajan/blender-open-mcp"
