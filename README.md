@@ -136,6 +136,13 @@ Example Claude/Cursor-style config:
 **Legacy aliases:** `blender_set_ollama_model`, `blender_set_ollama_url`,
 `blender_get_ollama_models` keep old Ollama-only clients working.
 
+**MCP Prompts** (`prompts/list` / `prompts/get`):
+- `blender_build_scene` – guided plan for building a scene from a description.
+- `blender_review_scene` – read-only inspection workflow.
+- `blender_configure_llm` – provider-switching instructions with examples.
+
+Prompts are registered in `src/blender_open_mcp/prompts.py`.
+
 ### Runtime provider switching (examples)
 
 ```text
@@ -284,6 +291,17 @@ Add new backends by inserting an entry in `PROVIDERS` (plus an alias in
 
 The suites mock `bpy` (addon tests), `httpx` (provider/PolyHaven routing),
 and the MCP client wire format, so they run without Blender or a live LLM.
+
+`tests/test_integration.py` additionally proves the layers work together:
+
+- an in-process `fastmcp.Client` session lists tools/prompts and calls
+  provider tools over the real MCP protocol;
+- the actual `addon.py` TCP server loop is started on a local port (bpy
+  mocked) and driven through the MCP server's Blender bridge, so
+  `blender_get_scene_info` and `blender_execute_code` round-trip over a real
+  socket;
+- a parity test pins every bridge command to a registered addon handler and
+  every `blender_*` tool to a registered MCP tool.
 
 ## Notes / known gaps
 

@@ -71,6 +71,10 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
   - `blender_list_llm_models(provider, base_url, api_key)` → model list.
   - Legacy Ollama aliases (`blender_set_ollama_model`, `blender_set_ollama_url`,
     `blender_get_ollama_models`) wrap the same state/tools.
+- **MCP Prompts** (`src/blender_open_mcp/prompts.py`) register templates via
+  `prompts/list` / `prompts/get`: `blender_build_scene`,
+  `blender_review_scene`, `blender_configure_llm`. `register_prompts(mcp)` is
+  called at import time in `server.py`.
 - `_llm_state` holds `provider`, `base_url`, `model`, `api_key`, `extra`;
   defaults come from env vars (`BLENDER_OPEN_MCP_*`) or CLI args.
 - All tools return strings: pretty JSON for success, or an `Error: ...` string
@@ -147,6 +151,13 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 - **New Blender capability:** handler in `addon.py` + registration in
   `HANDLERS` + flat tool in `server.py`.
 - **New MCP tool shape:** flat params; update client wrapper + tests together.
+
+## Tests proving the layers
+- `tests/test_integration.py` runs an in-process `fastmcp.Client` session
+  against the server FastMCP instance (list/call tools, list/get prompts) and
+  boots the real `addon.py` TCP loop on a local port to round-trip bridge
+  commands (`blender_get_scene_info`, `blender_execute_code`) over a real
+  socket with bpy mocked.
 
 ## Known gaps / notes
 - Runtime tests mock Blender and providers; a real Blender end-to-end pass is

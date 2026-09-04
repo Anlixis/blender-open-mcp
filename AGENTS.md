@@ -21,6 +21,8 @@ startup (CLI/env) and switched at runtime through MCP tools.
     `resolve_provider()`, `chat()`, `list_models()`, `ProviderError`. Add new
     backends here.
   - `client/` — canonical async MCP client (`BlenderMCPClient`) + CLI.
+  - `prompts.py` — MCP Prompts (`blender_build_scene`, `blender_review_scene`,
+    `blender_configure_llm`) registered via `register_prompts(mcp)`.
   - `__init__.py` — exports `main`.
 - `client/` — compat wrapper so legacy `from client import …` imports work
   from source; it bootstraps `src/` onto `sys.path` and re-exports the
@@ -87,6 +89,12 @@ startup (CLI/env) and switched at runtime through MCP tools.
 - Addon tests mock `bpy` at import time (see `tests/test_addon.py`) and test
   handlers/dispatch directly; they don't start a TCP server.
 - Client tests mock the MCP HTTP layer.
+- `tests/test_integration.py` proves the wiring: an in-process `fastmcp.Client`
+  against the server (tools + prompts), and the real `addon.py` TCP loop driven
+  over a socket by the server bridge.
 - Manual end-to-end: start the add-on in Blender, run
   `blender-mcp --transport http`, then
   `blender-mcp-client --host http://localhost:8000 tool blender_get_scene_info`.
+- When adding an MCP prompt, mirror the pattern in `prompts.py` and register it
+  there; update `tests/test_integration.py` expectations if the prompt set is
+  part of a contract.
