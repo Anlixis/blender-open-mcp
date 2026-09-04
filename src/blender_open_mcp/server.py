@@ -1,29 +1,42 @@
 """
-blender_open_mcp - MCP Server for Blender3D with Ollama Integration
+blender_open_mcp - MCP Server for Blender3D with provider-agnostic AI backends.
 
 Architecture:
-  - FastMCP server (port 8000): Exposes tools to MCP clients (Claude, Cursor, etc.)
-  - Blender add-on socket (port 9876): TCP server inside Blender that executes commands
-  - Ollama HTTP API (port 11434): Local LLM for natural language prompt handling
+  - FastMCP server (default port 8000): exposes tools to MCP clients.
+  - Blender add-on socket (default port 9876): TCP server inside Blender
+    that executes scene commands (addon.py).
+  - LLM backends: OpenAI-compatible REST APIs (OpenAI, Azure AI Foundry,
+    LM Studio, llama.cpp server, vLLM, ...), Ollama native API, and any
+    endpoint reachable via a base URL + optional API key.
 
 Communication flow:
-  MCP Client → FastMCP Server → (TCP) → Blender Add-on → bpy execution → result
-  MCP Client → FastMCP Server → (HTTP) → Ollama → LLM response
+  MCP Client -> FastMCP Server -> (TCP) -> Blender Add-on -> bpy execution
+  MCP Client -> FastMCP Server -> (HTTP) -> LLM provider -> assistant reply
+
+Providers can be configured at startup (CLI/env) and switched at runtime via
+the blender_set_llm_provider / blender_list_llm_models MCP tools.
+
+All tool signatures are flat (no wrapper objects) so any standard MCP client
+can call them with top-level arguments.
 """
 
 from __future__ import annotations
 
-import asyncio
+import argparse
 import json
 import logging
+import os
 import socket
 import sys
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import httpx
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from . import llm as llm_backend
+from .llm import ProviderError, resolve_provider
 
 # ---------------------------------------------------------------------------
 # Logging – use stderr so it doesn't pollute stdio transport
@@ -42,50 +55,71 @@ BLENDER_HOST: str = "localhost"
 BLENDER_PORT: int = 9876
 BLENDER_TIMEOUT: float = 30.0
 
-DEFAULT_OLLAMA_URL: str = "http://localhost:11434"
-DEFAULT_OLLAMA_MODEL: str = "llama3.2"
+DEFAULT_LLM_PROVIDER: str = os.environ.get("BLENDER_OPEN_MCP_PROVIDER", "ollama")
+DEFAULT_LLM_URL: str = os.environ.get(
+    "BLENDER_OPEN_MCP_BASE_URL", "http://localhost:11434"
+)
+DEFAULT_LLM_MODEL: str = os.environ.get(
+    "BLENDER_OPEN_MCP_MODEL", "llama3.2"
+)
+DEFAULT_LLM_API_KEY: Optional[str] = os.environ.get("BLENDER_OPEN_MCP_API_KEY")
 
 POLYHAVEN_API_BASE: str = "https://api.polyhaven.com"
 
+DEFAULT_SYSTEM_PROMPT: str = (
+    "You are an expert Blender 3D artist and Python developer. "
+    "You help users control Blender using the bpy Python API. "
+    "Provide concise, runnable Python code examples when appropriate."
+)
+
 # ---------------------------------------------------------------------------
-# Runtime state (mutable at runtime via set_* tools)
+# Runtime LLM state (mutable at runtime via blender_set_llm_provider)
 # ---------------------------------------------------------------------------
-_state: Dict[str, Any] = {
-    "ollama_url": DEFAULT_OLLAMA_URL,
-    "ollama_model": DEFAULT_OLLAMA_MODEL,
+_llm_state: Dict[str, Any] = {
+    "provider": DEFAULT_LLM_PROVIDER,
+    "base_url": DEFAULT_LLM_URL,
+    "model": DEFAULT_LLM_MODEL,
+    "api_key": DEFAULT_LLM_API_KEY,
+    "extra": {},
 }
 
 # ---------------------------------------------------------------------------
 # MCP Server
 # ---------------------------------------------------------------------------
-mcp = FastMCP("blender_open_mcp")
+mcp = FastMCP(
+    "blender_open_mcp",
+    instructions=(
+        "Control a live Blender session through the Model Context Protocol and "
+        "route natural-language prompts to any LLM backend (OpenAI-compatible, "
+        "Ollama, LM Studio, llama.cpp, Azure). Use blender_get_scene_info first, "
+        "then blender_get_llm_provider / blender_set_llm_provider to configure "
+        "the AI backend."
+    ),
+)
 
 
 # ===========================================================================
 # Shared helpers
 # ===========================================================================
 
-def _send_blender_command(command_type: str, params: Dict[str, Any] | None = None) -> Dict[str, Any]:
+def _send_blender_command(
+    command_type: str, params: Optional[Dict[str, Any]] = None
+) -> Dict[str, Any]:
     """
-    Send a JSON command to the Blender add-on TCP server and return the parsed response.
-
-    The Blender add-on listens on BLENDER_HOST:BLENDER_PORT.
-    Each command is a newline-terminated JSON object:
-        {"type": "<command_type>", "params": {...}}
-    The response is a JSON object:
-        {"status": "ok" | "error", "result": <any> | "message": "<error>"}
+    Send a JSON command to the Blender add-on TCP server and return the response.
 
     Raises:
-        ConnectionRefusedError: If Blender add-on is not running.
-        TimeoutError: If the command takes too long.
-        ValueError: If the response cannot be parsed.
+        ConnectionRefusedError: if Blender add-on is not running.
+        TimeoutError: if the command takes too long.
+        ValueError: if the response cannot be parsed.
     """
     payload = json.dumps({"type": command_type, "params": params or {}}) + "\n"
     try:
-        with socket.create_connection((BLENDER_HOST, BLENDER_PORT), timeout=BLENDER_TIMEOUT) as sock:
+        with socket.create_connection(
+            (BLENDER_HOST, BLENDER_PORT), timeout=BLENDER_TIMEOUT
+        ) as sock:
             sock.sendall(payload.encode("utf-8"))
-            # Read until connection closes
-            chunks: list[bytes] = []
+            chunks: List[bytes] = []
             while True:
                 chunk = sock.recv(4096)
                 if not chunk:
@@ -97,10 +131,10 @@ def _send_blender_command(command_type: str, params: Dict[str, Any] | None = Non
     except ConnectionRefusedError:
         raise ConnectionRefusedError(
             f"Cannot connect to Blender add-on at {BLENDER_HOST}:{BLENDER_PORT}. "
-            "Make sure Blender is open with the Blender MCP add-on enabled and the server started "
-            "(N-key sidebar → Blender MCP → Start MCP Server)."
+            "Make sure Blender is open with the Blender MCP add-on enabled and the "
+            "server started (N-key sidebar -> Blender MCP -> Start MCP Server)."
         )
-    except TimeoutError:
+    except socket.timeout:
         raise TimeoutError(
             f"Blender add-on did not respond within {BLENDER_TIMEOUT}s. "
             "The operation may still be running in Blender."
@@ -119,42 +153,9 @@ def _format_blender_result(response: Dict[str, Any]) -> str:
     return str(result)
 
 
-async def _query_ollama(prompt: str) -> str:
-    """
-    Send a prompt to the local Ollama server and return the assistant's reply.
-
-    Uses the /api/generate endpoint with stream=False.
-    """
-    url = f"{_state['ollama_url']}/api/generate"
-    payload = {
-        "model": _state["ollama_model"],
-        "prompt": prompt,
-        "stream": False,
-    }
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            return data.get("response", "").strip()
-        except httpx.ConnectError:
-            return (
-                f"Error: Cannot connect to Ollama at {_state['ollama_url']}. "
-                "Make sure Ollama is running: `ollama serve`."
-            )
-        except httpx.HTTPStatusError as exc:
-            return f"Error: Ollama returned HTTP {exc.response.status_code}: {exc.response.text}"
-        except Exception as exc:
-            return f"Error communicating with Ollama: {type(exc).__name__}: {exc}"
-
-
 def _handle_blender_error(exc: Exception) -> str:
     """Produce a friendly, actionable error string from common exceptions."""
-    if isinstance(exc, ConnectionRefusedError):
-        return str(exc)
-    if isinstance(exc, TimeoutError):
-        return str(exc)
-    if isinstance(exc, ValueError):
+    if isinstance(exc, (ConnectionRefusedError, TimeoutError, ValueError)):
         return str(exc)
     return (
         f"Unexpected error communicating with Blender: {type(exc).__name__}: {exc}. "
@@ -162,8 +163,101 @@ def _handle_blender_error(exc: Exception) -> str:
     )
 
 
+# ---------------------------------------------------------------------------
+# LLM helpers
+# ---------------------------------------------------------------------------
+
+def _mask_api_key(key: Optional[str]) -> Optional[str]:
+    if not key:
+        return None
+    if len(key) <= 8:
+        return "****"
+    return f"{key[:4]}...{key[-4:]}"
+
+
+def _handle_provider_error(exc: Exception) -> str:
+    """Convert provider-layer errors into friendly, actionable strings."""
+    if isinstance(exc, ProviderError):
+        return f"Error: {exc}"
+    return (
+        f"Error calling LLM provider: {type(exc).__name__}: {exc}. "
+        "Check blender_get_llm_provider for the active configuration."
+    )
+
+
+async def _query_llm(
+    prompt: str,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    system_prompt: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Send a prompt to the configured (or explicitly requested) LLM provider.
+
+    Missing fields fall back to the current runtime state (_llm_state).
+    Returns the assistant text, or an error string prefixed with "Error:".
+    """
+    provider_key = provider or _llm_state["provider"]
+    url = base_url or _llm_state["base_url"]
+    key = api_key if api_key is not None else _llm_state["api_key"]
+    model_name = model or _llm_state["model"]
+    extra_cfg = {**_llm_state.get("extra", {}), **(extra or {})}
+
+    system = system_prompt or DEFAULT_SYSTEM_PROMPT
+    messages = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": prompt},
+    ]
+
+    try:
+        return await llm_backend.chat(
+            messages,
+            provider=provider_key,
+            base_url=url,
+            api_key=key,
+            model=model_name,
+            extra=extra_cfg,
+        )
+    except Exception as exc:
+        return _handle_provider_error(exc)
+
+
+def _redact_state() -> Dict[str, Any]:
+    return {
+        "provider": _llm_state["provider"],
+        "base_url": _llm_state["base_url"],
+        "model": _llm_state["model"],
+        "api_key": _mask_api_key(_llm_state.get("api_key")),
+        "extra": _llm_state.get("extra", {}),
+        "supported_providers": sorted(llm_backend.PROVIDERS),
+    }
+
+
+def _apply_provider_config(
+    provider: Optional[str],
+    base_url: Optional[str],
+    api_key: Optional[str],
+    model: Optional[str],
+    extra: Optional[Dict[str, Any]],
+) -> None:
+    """Update runtime LLM state from tool/CLI arguments (partial update)."""
+    if provider:
+        _llm_state["provider"] = resolve_provider(provider)
+    if base_url:
+        _llm_state["base_url"] = base_url.rstrip("/")
+    if api_key is not None:
+        _llm_state["api_key"] = api_key
+    if model:
+        _llm_state["model"] = model
+    if extra is not None:
+        _llm_state["extra"] = dict(extra)
+
+
 # ===========================================================================
-# Input models (Pydantic v2)
+# Input models (Pydantic v2) — used for shared validation helpers
 # ===========================================================================
 
 class ResponseFormat(str, Enum):
@@ -171,26 +265,14 @@ class ResponseFormat(str, Enum):
     MARKDOWN = "markdown"
 
 
-class GetObjectInfoInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    object_name: str = Field(..., description="Name of the Blender object (e.g., 'Cube', 'Camera')", min_length=1, max_length=256)
-    response_format: ResponseFormat = Field(default=ResponseFormat.MARKDOWN, description="Output format: 'markdown' or 'json'")
+class Vec3(BaseModel):
+    model_config = ConfigDict(validate_assignment=True)
+    x: float = Field(default=0.0, description="X coordinate")
+    y: float = Field(default=0.0, description="Y coordinate")
+    z: float = Field(default=0.0, description="Z coordinate")
 
-
-class ObjectType(str, Enum):
-    MESH = "MESH"
-    CURVE = "CURVE"
-    SURFACE = "SURFACE"
-    META = "META"
-    FONT = "FONT"
-    ARMATURE = "ARMATURE"
-    LATTICE = "LATTICE"
-    EMPTY = "EMPTY"
-    LIGHT = "LIGHT"
-    CAMERA = "CAMERA"
-    LIGHT_PROBE = "LIGHT_PROBE"
-    SPEAKER = "SPEAKER"
-    GPENCIL = "GPENCIL"
+    def as_list(self) -> List[float]:
+        return [self.x, self.y, self.z]
 
 
 class PrimitiveType(str, Enum):
@@ -206,159 +288,20 @@ class PrimitiveType(str, Enum):
     MONKEY = "MONKEY"
 
 
-class Vec3(BaseModel):
-    model_config = ConfigDict(validate_assignment=True)
-    x: float = Field(default=0.0, description="X coordinate")
-    y: float = Field(default=0.0, description="Y coordinate")
-    z: float = Field(default=0.0, description="Z coordinate")
-
-    def as_list(self) -> List[float]:
-        return [self.x, self.y, self.z]
-
-
-class CreateObjectInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    primitive_type: PrimitiveType = Field(
-        default=PrimitiveType.CUBE,
-        description="Type of primitive mesh to create: CUBE, SPHERE, CYLINDER, CONE, TORUS, PLANE, CIRCLE, ICO_SPHERE, GRID, MONKEY"
-    )
-    name: Optional[str] = Field(default=None, description="Name for the new object. If None, Blender assigns a default.", max_length=256)
-    location: Optional[Vec3] = Field(default=None, description="World-space location {x, y, z}")
-    rotation: Optional[Vec3] = Field(default=None, description="Euler rotation in radians {x, y, z}")
-    scale: Optional[Vec3] = Field(default=None, description="Scale {x, y, z}")
-
-
-class ModifyObjectInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    name: str = Field(..., description="Name of the Blender object to modify", min_length=1, max_length=256)
-    location: Optional[Vec3] = Field(default=None, description="New world-space location {x, y, z}")
-    rotation: Optional[Vec3] = Field(default=None, description="New Euler rotation in radians {x, y, z}")
-    scale: Optional[Vec3] = Field(default=None, description="New scale {x, y, z}")
-    visible: Optional[bool] = Field(default=None, description="Set viewport visibility (True = visible, False = hidden)")
-
-
-class DeleteObjectInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    name: str = Field(..., description="Name of the Blender object to delete", min_length=1, max_length=256)
-
-
-class SetMaterialInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    object_name: str = Field(..., description="Name of the Blender object", min_length=1, max_length=256)
-    material_name: str = Field(..., description="Name of the material to create/assign", min_length=1, max_length=256)
-    color: Optional[List[float]] = Field(
-        default=None,
-        description="RGBA color as [R, G, B, A] with values in [0.0, 1.0]. Example: [1.0, 0.0, 0.0, 1.0] for red."
-    )
-
-    @field_validator("color")
-    @classmethod
-    def validate_color(cls, v: Optional[List[float]]) -> Optional[List[float]]:
-        if v is None:
-            return v
-        if len(v) not in (3, 4):
-            raise ValueError("color must be [R, G, B] or [R, G, B, A]")
-        for c in v:
-            if not (0.0 <= c <= 1.0):
-                raise ValueError(f"Color channel {c} out of range [0.0, 1.0]")
-        if len(v) == 3:
-            v = v + [1.0]
-        return v
-
-
-class RenderImageInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    file_path: str = Field(
-        ...,
-        description="Absolute file path to save the render output (e.g., '/tmp/render.png'). Blender must have write access.",
-        min_length=1,
-        max_length=1024
-    )
-
-
-class ExecuteCodeInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    code: str = Field(
-        ...,
-        description="Python code to execute inside Blender's Python environment via bpy. Use with caution.",
-        min_length=1
-    )
-
-
 class PolyHavenAssetType(str, Enum):
-    HDRIs = "hdris"
+    HDRIS = "hdris"
     TEXTURES = "textures"
     MODELS = "models"
     ALL = "all"
 
 
-class GetPolyHavenCategoriesInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    asset_type: PolyHavenAssetType = Field(
-        default=PolyHavenAssetType.TEXTURES,
-        description="Asset type to list categories for: 'hdris', 'textures', 'models', or 'all'"
-    )
+def _vec3_arg(value: Optional[Vec3]) -> Optional[List[float]]:
+    return value.as_list() if value is not None else None
 
 
-class SearchPolyHavenInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    asset_type: PolyHavenAssetType = Field(
-        default=PolyHavenAssetType.TEXTURES,
-        description="Asset type to search: 'hdris', 'textures', 'models', or 'all'"
-    )
-    categories: Optional[List[str]] = Field(
-        default=None,
-        description="Category filter list (e.g., ['wood', 'metal']). If None, returns all assets."
-    )
-    limit: int = Field(default=20, ge=1, le=100, description="Maximum number of results to return")
-    offset: int = Field(default=0, ge=0, description="Number of results to skip for pagination")
-
-
-class DownloadPolyHavenInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    asset_id: str = Field(..., description="PolyHaven asset ID (e.g., 'brick_wall_001')", min_length=1, max_length=128)
-    asset_type: PolyHavenAssetType = Field(
-        default=PolyHavenAssetType.TEXTURES,
-        description="Type of asset: 'hdris', 'textures', or 'models'"
-    )
-    resolution: str = Field(
-        default="1k",
-        description="Resolution string (e.g., '1k', '2k', '4k', '8k')"
-    )
-    file_format: str = Field(
-        default="jpg",
-        description="File format (e.g., 'jpg', 'png', 'exr', 'blend', 'gltf', 'fbx')"
-    )
-
-
-class SetTextureInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    object_name: str = Field(..., description="Name of the Blender object to texture", min_length=1, max_length=256)
-    texture_id: str = Field(..., description="PolyHaven asset ID of the already-downloaded texture", min_length=1, max_length=128)
-
-
-class SetOllamaModelInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    model_name: str = Field(..., description="Ollama model name (e.g., 'llama3.2', 'gemma3', 'mistral')", min_length=1, max_length=128)
-
-
-class SetOllamaUrlInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    url: str = Field(
-        ...,
-        description="Ollama server base URL (e.g., 'http://localhost:11434')",
-        min_length=1,
-        max_length=512
-    )
-
-
-class PromptInput(BaseModel):
-    model_config = ConfigDict(str_strip_whitespace=True, validate_assignment=True, extra="forbid")
-    prompt: str = Field(..., description="Natural language prompt to send to the Ollama model", min_length=1)
-    system_prompt: Optional[str] = Field(
-        default=None,
-        description="Optional system prompt to prepend. Defaults to a Blender-expert system prompt."
-    )
+def _enum_value(value: Any) -> str:
+    """Return the string value of an enum or plain string argument."""
+    return value.value if hasattr(value, "value") else str(value)
 
 
 # ===========================================================================
@@ -373,21 +316,12 @@ class PromptInput(BaseModel):
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
 async def blender_get_scene_info() -> str:
-    """
-    Retrieve a full summary of the current Blender scene.
-
-    Returns scene name, frame range, render settings, list of all objects
-    (with their types, locations, and visibility), active camera, and world info.
-
-    Returns:
-        str: JSON-formatted scene summary or an error message.
-    """
+    """Retrieve a full summary of the current Blender scene (objects, camera, render settings)."""
     try:
-        response = _send_blender_command("get_scene_info")
-        return _format_blender_result(response)
+        return _format_blender_result(_send_blender_command("get_scene_info"))
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -400,28 +334,19 @@ async def blender_get_scene_info() -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_get_object_info(params: GetObjectInfoInput) -> str:
-    """
-    Retrieve detailed information about a specific Blender object by name.
-
-    Returns the object's type, world matrix, location, rotation, scale,
-    material slots, mesh vertex count (for MESH objects), and custom properties.
-
-    Args:
-        params (GetObjectInfoInput):
-            - object_name (str): Exact name of the object in the Blender scene.
-            - response_format (ResponseFormat): 'markdown' or 'json'.
-
-    Returns:
-        str: Formatted object info or an error message if the object doesn't exist.
-    """
+async def blender_get_object_info(
+    object_name: str,
+    response_format: str = "markdown",
+) -> str:
+    """Retrieve detailed information about a specific Blender object by name."""
     try:
-        response = _send_blender_command("get_object_info", {"object_name": params.object_name})
-        result = _format_blender_result(response)
-        if params.response_format == ResponseFormat.MARKDOWN:
-            return f"## Object: {params.object_name}\n\n```json\n{result}\n```"
+        result = _format_blender_result(
+            _send_blender_command("get_object_info", {"object_name": object_name})
+        )
+        if response_format == ResponseFormat.MARKDOWN.value:
+            return f"## Object: {object_name}\n\n```json\n{result}\n```"
         return result
     except Exception as exc:
         return _handle_blender_error(exc)
@@ -435,38 +360,30 @@ async def blender_get_object_info(params: GetObjectInfoInput) -> str:
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_create_object(params: CreateObjectInput) -> str:
-    """
-    Create a new primitive mesh object in the Blender scene.
-
-    Supported primitives: CUBE, SPHERE, CYLINDER, CONE, TORUS, PLANE,
-    CIRCLE, ICO_SPHERE, GRID, MONKEY.
-
-    Args:
-        params (CreateObjectInput):
-            - primitive_type (PrimitiveType): Mesh primitive to add.
-            - name (Optional[str]): Desired object name. Blender assigns a default if None.
-            - location (Optional[Vec3]): World-space position {x, y, z}.
-            - rotation (Optional[Vec3]): Euler angles in radians {x, y, z}.
-            - scale (Optional[Vec3]): Scale factors {x, y, z}.
-
-    Returns:
-        str: Confirmation with the created object's name, or an error message.
-    """
-    cmd_params: Dict[str, Any] = {"type": params.primitive_type.value}
-    if params.name:
-        cmd_params["name"] = params.name
-    if params.location:
-        cmd_params["location"] = params.location.as_list()
-    if params.rotation:
-        cmd_params["rotation"] = params.rotation.as_list()
-    if params.scale:
-        cmd_params["scale"] = params.scale.as_list()
+async def blender_create_object(
+    primitive_type: PrimitiveType = PrimitiveType.CUBE,
+    name: Optional[str] = None,
+    location: Optional[Vec3] = None,
+    rotation: Optional[Vec3] = None,
+    scale: Optional[Vec3] = None,
+) -> str:
+    """Create a new primitive mesh object in the Blender scene."""
+    cmd_params: Dict[str, Any] = {"type": _enum_value(primitive_type)}
+    if name:
+        cmd_params["name"] = name
+    loc = _vec3_arg(location)
+    rot = _vec3_arg(rotation)
+    scl = _vec3_arg(scale)
+    if loc:
+        cmd_params["location"] = loc
+    if rot:
+        cmd_params["rotation"] = rot
+    if scl:
+        cmd_params["scale"] = scl
     try:
-        response = _send_blender_command("create_object", cmd_params)
-        return _format_blender_result(response)
+        return _format_blender_result(_send_blender_command("create_object", cmd_params))
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -479,37 +396,30 @@ async def blender_create_object(params: CreateObjectInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_modify_object(params: ModifyObjectInput) -> str:
-    """
-    Modify an existing Blender object's transform properties or visibility.
-
-    Only the fields you provide will be updated; omitted fields remain unchanged.
-
-    Args:
-        params (ModifyObjectInput):
-            - name (str): Exact name of the object to modify.
-            - location (Optional[Vec3]): New world-space location {x, y, z}.
-            - rotation (Optional[Vec3]): New Euler rotation in radians {x, y, z}.
-            - scale (Optional[Vec3]): New scale {x, y, z}.
-            - visible (Optional[bool]): Viewport visibility toggle.
-
-    Returns:
-        str: Confirmation of changes applied, or an error message.
-    """
-    cmd_params: Dict[str, Any] = {"name": params.name}
-    if params.location:
-        cmd_params["location"] = params.location.as_list()
-    if params.rotation:
-        cmd_params["rotation"] = params.rotation.as_list()
-    if params.scale:
-        cmd_params["scale"] = params.scale.as_list()
-    if params.visible is not None:
-        cmd_params["visible"] = params.visible
+async def blender_modify_object(
+    name: str,
+    location: Optional[Vec3] = None,
+    rotation: Optional[Vec3] = None,
+    scale: Optional[Vec3] = None,
+    visible: Optional[bool] = None,
+) -> str:
+    """Modify an existing Blender object's transform properties or visibility."""
+    cmd_params: Dict[str, Any] = {"name": name}
+    loc = _vec3_arg(location)
+    rot = _vec3_arg(rotation)
+    scl = _vec3_arg(scale)
+    if loc:
+        cmd_params["location"] = loc
+    if rot:
+        cmd_params["rotation"] = rot
+    if scl:
+        cmd_params["scale"] = scl
+    if visible is not None:
+        cmd_params["visible"] = visible
     try:
-        response = _send_blender_command("modify_object", cmd_params)
-        return _format_blender_result(response)
+        return _format_blender_result(_send_blender_command("modify_object", cmd_params))
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -522,25 +432,14 @@ async def blender_modify_object(params: ModifyObjectInput) -> str:
         "destructiveHint": True,
         "idempotentHint": False,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_delete_object(params: DeleteObjectInput) -> str:
-    """
-    Permanently delete an object from the current Blender scene.
-
-    Warning: This operation is destructive. The object and its data will be removed.
-    Use blender_get_scene_info first to confirm the correct object name.
-
-    Args:
-        params (DeleteObjectInput):
-            - name (str): Exact name of the object to delete.
-
-    Returns:
-        str: Confirmation message or an error if the object was not found.
-    """
+async def blender_delete_object(name: str) -> str:
+    """Permanently delete an object from the current Blender scene. Destructive."""
     try:
-        response = _send_blender_command("delete_object", {"name": params.name})
-        return _format_blender_result(response)
+        return _format_blender_result(
+            _send_blender_command("delete_object", {"name": name})
+        )
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -557,34 +456,27 @@ async def blender_delete_object(params: DeleteObjectInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_set_material(params: SetMaterialInput) -> str:
-    """
-    Create a new Principled BSDF material and assign it to a Blender object.
-
-    If a material with the given name already exists, it will be reused and its
-    base color updated if a color is provided.
-
-    Args:
-        params (SetMaterialInput):
-            - object_name (str): Object to receive the material.
-            - material_name (str): Name for the material.
-            - color (Optional[List[float]]): RGBA color [R, G, B, A] in [0.0, 1.0].
-              Example: [0.8, 0.2, 0.1, 1.0] for a reddish color.
-
-    Returns:
-        str: Confirmation or error message.
-    """
+async def blender_set_material(
+    object_name: str,
+    material_name: str,
+    color: Optional[List[float]] = None,
+) -> str:
+    """Create a Principled BSDF material (reusing by name) and assign it to an object."""
+    if color is not None:
+        if len(color) not in (3, 4):
+            return "Error: color must be [R, G, B] or [R, G, B, A]"
+        if any(not (0.0 <= c <= 1.0) for c in color):
+            return "Error: color channels must be in [0.0, 1.0]"
     cmd_params: Dict[str, Any] = {
-        "object_name": params.object_name,
-        "material_name": params.material_name,
+        "object_name": object_name,
+        "material_name": material_name,
     }
-    if params.color:
-        cmd_params["color"] = params.color
+    if color:
+        cmd_params["color"] = color
     try:
-        response = _send_blender_command("set_material", cmd_params)
-        return _format_blender_result(response)
+        return _format_blender_result(_send_blender_command("set_material", cmd_params))
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -597,25 +489,14 @@ async def blender_set_material(params: SetMaterialInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_render_image(params: RenderImageInput) -> str:
-    """
-    Trigger a render of the current Blender scene and save the result to disk.
-
-    Uses the scene's current render engine, resolution, and camera settings.
-    The file_path must use an absolute path that Blender can write to.
-
-    Args:
-        params (RenderImageInput):
-            - file_path (str): Absolute output path (e.g., '/tmp/output.png').
-
-    Returns:
-        str: Confirmation with the saved path, or an error message.
-    """
+async def blender_render_image(file_path: str) -> str:
+    """Trigger a render of the current Blender scene and save the result to disk."""
     try:
-        response = _send_blender_command("render_image", {"file_path": params.file_path})
-        return _format_blender_result(response)
+        return _format_blender_result(
+            _send_blender_command("render_image", {"file_path": file_path})
+        )
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -632,29 +513,14 @@ async def blender_render_image(params: RenderImageInput) -> str:
         "destructiveHint": True,
         "idempotentHint": False,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_execute_code(params: ExecuteCodeInput) -> str:
-    """
-    Execute arbitrary Python code inside Blender using the bpy module.
-
-    Use this for complex operations not covered by specific tools, such as
-    node graph manipulation, animation keyframing, or batch operations.
-
-    WARNING: This tool runs with full Blender Python access. Use with caution.
-    Avoid destructive operations unless intentional.
-
-    Args:
-        params (ExecuteCodeInput):
-            - code (str): Valid Python code using bpy, mathutils, etc.
-              Example: "import bpy\\nbpy.ops.object.select_all(action='SELECT')\\nprint(len(bpy.context.selected_objects))"
-
-    Returns:
-        str: stdout/result from the executed code, or an error with traceback info.
-    """
+async def blender_execute_code(code: str) -> str:
+    """Execute arbitrary Python code inside Blender using the bpy module. Destructive."""
     try:
-        response = _send_blender_command("execute_blender_code", {"code": params.code})
-        return _format_blender_result(response)
+        return _format_blender_result(
+            _send_blender_command("execute_blender_code", {"code": code})
+        )
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -671,31 +537,24 @@ async def blender_execute_code(params: ExecuteCodeInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
-    }
+    },
 )
-async def blender_get_polyhaven_categories(params: GetPolyHavenCategoriesInput) -> str:
-    """
-    Fetch the list of available asset categories from the PolyHaven API.
-
-    PolyHaven provides free CC0 HDRIs, textures, and 3D models. Use this tool
-    to discover available categories before searching or downloading assets.
-
-    Args:
-        params (GetPolyHavenCategoriesInput):
-            - asset_type (PolyHavenAssetType): 'hdris', 'textures', 'models', or 'all'.
-
-    Returns:
-        str: JSON list of category names or an error message.
-    """
+async def blender_get_polyhaven_categories(
+    asset_type: PolyHavenAssetType = PolyHavenAssetType.TEXTURES,
+) -> str:
+    """Fetch the list of available asset categories from the PolyHaven API."""
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
-            url = f"{POLYHAVEN_API_BASE}/categories/{params.asset_type.value}"
+            url = f"{POLYHAVEN_API_BASE}/categories/{_enum_value(asset_type)}"
             resp = await client.get(url)
             resp.raise_for_status()
             categories = resp.json()
         return json.dumps(categories, indent=2)
     except httpx.HTTPStatusError as exc:
-        return f"Error: PolyHaven API returned HTTP {exc.response.status_code}: {exc.response.text}"
+        return (
+            f"Error: PolyHaven API returned HTTP {exc.response.status_code}: "
+            f"{exc.response.text}"
+        )
     except httpx.ConnectError:
         return "Error: Cannot reach PolyHaven API. Check your internet connection."
     except Exception as exc:
@@ -710,48 +569,37 @@ async def blender_get_polyhaven_categories(params: GetPolyHavenCategoriesInput) 
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
-    }
+    },
 )
-async def blender_search_polyhaven_assets(params: SearchPolyHavenInput) -> str:
-    """
-    Search the PolyHaven asset library by type and optional category filters.
-
-    Returns paginated asset metadata including IDs, names, categories, and
-    download availability. Use the asset_id from results with blender_download_polyhaven_asset.
-
-    Args:
-        params (SearchPolyHavenInput):
-            - asset_type (PolyHavenAssetType): Asset type to search.
-            - categories (Optional[List[str]]): Category filters (e.g., ['wood', 'floor']).
-            - limit (int): Max results to return (1-100, default 20).
-            - offset (int): Pagination offset.
-
-    Returns:
-        str: JSON object with items, total, has_more, next_offset.
-    """
+async def blender_search_polyhaven_assets(
+    asset_type: PolyHavenAssetType = PolyHavenAssetType.TEXTURES,
+    categories: Optional[List[str]] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> str:
+    """Search the PolyHaven asset library by type and optional category filters."""
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             url = f"{POLYHAVEN_API_BASE}/assets"
-            query: Dict[str, Any] = {"type": params.asset_type.value}
-            if params.categories:
-                query["categories"] = ",".join(params.categories)
+            query: Dict[str, Any] = {"type": _enum_value(asset_type)}
+            if categories:
+                query["categories"] = ",".join(categories)
             resp = await client.get(url, params=query)
             resp.raise_for_status()
             all_assets: Dict[str, Any] = resp.json()
 
         items = list(all_assets.items())
         total = len(items)
-        page = items[params.offset: params.offset + params.limit]
+        page = items[offset: offset + limit]
         result = {
             "total": total,
             "count": len(page),
-            "offset": params.offset,
-            "has_more": total > params.offset + len(page),
-            "next_offset": params.offset + len(page) if total > params.offset + len(page) else None,
-            "items": [
-                {"id": k, **v}
-                for k, v in page
-            ],
+            "offset": offset,
+            "has_more": total > offset + len(page),
+            "next_offset": offset + len(page)
+            if total > offset + len(page)
+            else None,
+            "items": [{"id": k, **v} for k, v in page],
         }
         return json.dumps(result, indent=2)
     except httpx.HTTPStatusError as exc:
@@ -770,51 +618,42 @@ async def blender_search_polyhaven_assets(params: SearchPolyHavenInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
-    }
+    },
 )
-async def blender_download_polyhaven_asset(params: DownloadPolyHavenInput) -> str:
-    """
-    Download a PolyHaven asset and import it into the active Blender scene.
-
-    This tool first resolves the asset's download URL from the PolyHaven API,
-    then instructs the Blender add-on to download and import the asset.
-    For HDRIs, sets the world environment. For textures/models, places them in the scene.
-
-    Args:
-        params (DownloadPolyHavenInput):
-            - asset_id (str): PolyHaven asset slug (e.g., 'brick_wall_001').
-            - asset_type (PolyHavenAssetType): 'hdris', 'textures', or 'models'.
-            - resolution (str): Download resolution ('1k', '2k', '4k', '8k').
-            - file_format (str): File format ('jpg', 'png', 'exr', 'blend', 'gltf', 'fbx').
-
-    Returns:
-        str: Confirmation that the asset was downloaded and imported, or an error.
-    """
-    # First resolve the download URL from PolyHaven API
+async def blender_download_polyhaven_asset(
+    asset_id: str,
+    asset_type: PolyHavenAssetType = PolyHavenAssetType.TEXTURES,
+    resolution: str = "1k",
+    file_format: str = "jpg",
+) -> str:
+    """Download a PolyHaven asset and import it into the active Blender scene."""
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
-            files_url = f"{POLYHAVEN_API_BASE}/files/{params.asset_id}"
+            files_url = f"{POLYHAVEN_API_BASE}/files/{asset_id}"
             resp = await client.get(files_url)
             resp.raise_for_status()
             files_data: Dict[str, Any] = resp.json()
     except httpx.ConnectError:
         return "Error: Cannot reach PolyHaven API. Check your internet connection."
     except httpx.HTTPStatusError as exc:
-        return f"Error: PolyHaven API returned HTTP {exc.response.status_code} for asset '{params.asset_id}'"
+        return (
+            f"Error: PolyHaven API returned HTTP {exc.response.status_code} "
+            f"for asset '{asset_id}'"
+        )
     except Exception as exc:
         return f"Error fetching PolyHaven asset info: {type(exc).__name__}: {exc}"
 
-    # Instruct Blender to download and import
     try:
         cmd_params: Dict[str, Any] = {
-            "asset_id": params.asset_id,
-            "asset_type": params.asset_type.value,
-            "resolution": params.resolution,
-            "file_format": params.file_format,
+            "asset_id": asset_id,
+            "asset_type": _enum_value(asset_type),
+            "resolution": resolution,
+            "file_format": file_format,
             "files_data": files_data,
         }
-        response = _send_blender_command("download_polyhaven_asset", cmd_params)
-        return _format_blender_result(response)
+        return _format_blender_result(
+            _send_blender_command("download_polyhaven_asset", cmd_params)
+        )
     except Exception as exc:
         return _handle_blender_error(exc)
 
@@ -827,73 +666,169 @@ async def blender_download_polyhaven_asset(params: DownloadPolyHavenInput) -> st
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_set_texture(params: SetTextureInput) -> str:
-    """
-    Apply a previously downloaded PolyHaven texture to a Blender object.
-
-    The texture must have been downloaded first using blender_download_polyhaven_asset.
-    Creates a new material with the texture connected to a Principled BSDF shader.
-
-    Args:
-        params (SetTextureInput):
-            - object_name (str): Name of the Blender object to texture.
-            - texture_id (str): PolyHaven asset ID of the downloaded texture.
-
-    Returns:
-        str: Confirmation or error message.
-    """
+async def blender_set_texture(object_name: str, texture_id: str) -> str:
+    """Apply a previously downloaded PolyHaven texture to a Blender object."""
     try:
-        response = _send_blender_command("set_texture", {
-            "object_name": params.object_name,
-            "texture_id": params.texture_id,
-        })
-        return _format_blender_result(response)
+        return _format_blender_result(
+            _send_blender_command(
+                "set_texture",
+                {"object_name": object_name, "texture_id": texture_id},
+            )
+        )
     except Exception as exc:
         return _handle_blender_error(exc)
 
 
 # ===========================================================================
-# MCP Tools — Ollama / AI Integration
+# MCP Tools — LLM / AI Integration (provider-agnostic)
 # ===========================================================================
 
 @mcp.tool(
     name="blender_ai_prompt",
     annotations={
-        "title": "Send Natural Language Prompt to Ollama",
+        "title": "Send Natural Language Prompt to LLM",
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": True,
-    }
+    },
 )
-async def blender_ai_prompt(params: PromptInput) -> str:
+async def blender_ai_prompt(
+    prompt: str,
+    system_prompt: Optional[str] = None,
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+) -> str:
     """
-    Send a natural language prompt to the local Ollama model.
+    Send a natural-language prompt to the configured LLM backend.
 
-    Ollama processes the prompt and returns an AI-generated response. This tool
-    is useful for getting Blender scripting help, asset suggestions, or generating
-    bpy code that can then be executed with blender_execute_code.
-
-    The default system prompt positions the model as a Blender expert.
-
-    Args:
-        params (PromptInput):
-            - prompt (str): Your question or instruction in natural language.
-            - system_prompt (Optional[str]): Override the default Blender-expert system prompt.
-
-    Returns:
-        str: The Ollama model's response text.
+    Works with any supported provider: OpenAI-compatible endpoints (OpenAI,
+    Azure AI Foundry, LM Studio, llama.cpp, vLLM, ...) and Ollama. Use
+    blender_set_llm_provider first to choose the backend, or override the
+    provider/base_url/model per call.
     """
-    system = params.system_prompt or (
-        "You are an expert Blender 3D artist and Python developer. "
-        "You help users control Blender using the bpy Python API. "
-        "Provide concise, runnable Python code examples when appropriate. "
-        f"Current Ollama model: {_state['ollama_model']}."
+    return await _query_llm(
+        prompt,
+        provider=provider,
+        base_url=base_url,
+        api_key=api_key,
+        model=model,
+        system_prompt=system_prompt,
     )
-    full_prompt = f"{system}\n\nUser: {params.prompt}\n\nAssistant:"
-    return await _query_ollama(full_prompt)
+
+
+@mcp.tool(
+    name="blender_get_llm_provider",
+    annotations={
+        "title": "Get Active LLM Provider",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_get_llm_provider() -> str:
+    """Return the active LLM provider configuration (API key masked)."""
+    try:
+        return json.dumps(_redact_state(), indent=2)
+    except Exception as exc:
+        return _handle_provider_error(exc)
+
+
+@mcp.tool(
+    name="blender_set_llm_provider",
+    annotations={
+        "title": "Switch LLM Provider",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_set_llm_provider(
+    provider: str,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+    model: Optional[str] = None,
+    extra: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    Switch/configure the active LLM provider at runtime.
+
+    Examples:
+      - Ollama:    provider="ollama", base_url="http://localhost:11434", model="llama3.2"
+      - LM Studio: provider="lmstudio", base_url="http://localhost:1234/v1", model="local-model"
+      - llama.cpp: provider="llamacpp", base_url="http://localhost:8080/v1"
+      - OpenAI:    provider="openai", api_key="sk-...", model="gpt-4o-mini"
+      - Generic:   provider="openai_compat", base_url="<any>", api_key="..."
+      - Azure:     provider="azure", api_key="...",
+                   extra={"resource": "r", "deployment": "d", "api_version": "..."}
+    """
+    try:
+        _apply_provider_config(provider, base_url, api_key, model, extra)
+        return json.dumps(_redact_state(), indent=2)
+    except Exception as exc:
+        return _handle_provider_error(exc)
+
+
+@mcp.tool(
+    name="blender_list_llm_models",
+    annotations={
+        "title": "List Available LLM Models",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def blender_list_llm_models(
+    provider: Optional[str] = None,
+    base_url: Optional[str] = None,
+    api_key: Optional[str] = None,
+) -> str:
+    """
+    List models available from a provider (Ollama /api/tags, OpenAI-compatible
+    /models). Defaults to the active provider.
+    """
+    provider_key = provider or _llm_state["provider"]
+    try:
+        models = await llm_backend.list_models(
+            provider=provider_key,
+            base_url=base_url or _llm_state["base_url"],
+            api_key=api_key if api_key is not None else _llm_state["api_key"],
+            extra=_llm_state.get("extra", {}),
+        )
+        return json.dumps(
+            {
+                "provider": provider_key,
+                "base_url": base_url or _llm_state["base_url"],
+                "models": models,
+            },
+            indent=2,
+        )
+    except Exception as exc:
+        return _handle_provider_error(exc)
+
+
+# Backward-compatible aliases ------------------------------------------------
+
+@mcp.tool(
+    name="blender_get_ollama_models",
+    annotations={
+        "title": "List Ollama Models",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    },
+)
+async def blender_get_ollama_models() -> str:
+    """List models available from the active Ollama endpoint (alias for blender_list_llm_models)."""
+    return await blender_list_llm_models(provider="ollama")
 
 
 @mcp.tool(
@@ -904,24 +839,11 @@ async def blender_ai_prompt(params: PromptInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_set_ollama_model(params: SetOllamaModelInput) -> str:
-    """
-    Switch the Ollama language model used for AI prompts.
-
-    The model must already be pulled in Ollama (use `ollama pull <model>`).
-    Use blender_get_ollama_models to list available models.
-
-    Args:
-        params (SetOllamaModelInput):
-            - model_name (str): Ollama model name (e.g., 'llama3.2', 'gemma3', 'mistral').
-
-    Returns:
-        str: Confirmation of the model change.
-    """
-    _state["ollama_model"] = params.model_name
-    return f"Ollama model set to: {params.model_name}"
+async def blender_set_ollama_model(model_name: str) -> str:
+    """Set the Ollama model used by the LLM backend."""
+    return await blender_set_llm_provider(provider="ollama", model=model_name)
 
 
 @mcp.tool(
@@ -932,69 +854,11 @@ async def blender_set_ollama_model(params: SetOllamaModelInput) -> str:
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": False,
-    }
+    },
 )
-async def blender_set_ollama_url(params: SetOllamaUrlInput) -> str:
-    """
-    Update the Ollama server base URL.
-
-    Useful if Ollama is running on a non-default host or port, or on a remote machine.
-
-    Args:
-        params (SetOllamaUrlInput):
-            - url (str): New base URL (e.g., 'http://192.168.1.100:11434').
-
-    Returns:
-        str: Confirmation of the URL change.
-    """
-    _state["ollama_url"] = params.url
-    return f"Ollama URL set to: {params.url}"
-
-
-@mcp.tool(
-    name="blender_get_ollama_models",
-    annotations={
-        "title": "List Available Ollama Models",
-        "readOnlyHint": True,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
-async def blender_get_ollama_models() -> str:
-    """
-    List all locally available Ollama models.
-
-    Queries the Ollama /api/tags endpoint to show models that have been pulled
-    and are ready to use. Returns name, size, and modification date for each model.
-
-    Returns:
-        str: JSON-formatted list of available models or an error message.
-    """
-    url = f"{_state['ollama_url']}/api/tags"
-    async with httpx.AsyncClient(timeout=10.0) as client:
-        try:
-            resp = await client.get(url)
-            resp.raise_for_status()
-            data = resp.json()
-            models = [
-                {
-                    "name": m.get("name"),
-                    "size_gb": round(m.get("size", 0) / 1e9, 2),
-                    "modified_at": m.get("modified_at", ""),
-                }
-                for m in data.get("models", [])
-            ]
-            return json.dumps({"current_model": _state["ollama_model"], "available_models": models}, indent=2)
-        except httpx.ConnectError:
-            return (
-                f"Error: Cannot connect to Ollama at {_state['ollama_url']}. "
-                "Make sure Ollama is running: `ollama serve`."
-            )
-        except httpx.HTTPStatusError as exc:
-            return f"Error: Ollama returned HTTP {exc.response.status_code}"
-        except Exception as exc:
-            return f"Error listing Ollama models: {type(exc).__name__}: {exc}"
+async def blender_set_ollama_url(url: str) -> str:
+    """Update the Ollama server base URL used by the LLM backend."""
+    return await blender_set_llm_provider(provider="ollama", base_url=url)
 
 
 # ===========================================================================
@@ -1003,41 +867,95 @@ async def blender_get_ollama_models() -> str:
 
 def main() -> None:
     """CLI entry point registered as `blender-mcp` in pyproject.toml."""
-    global BLENDER_HOST, BLENDER_PORT
-    import argparse
-
+    global BLENDER_HOST, BLENDER_PORT, _llm_state
     parser = argparse.ArgumentParser(
         prog="blender-mcp",
-        description="blender-open-mcp: MCP server for controlling Blender3D with local AI models.",
+        description="blender-open-mcp: MCP server for controlling Blender3D "
+        "with provider-agnostic local/remote AI backends.",
     )
-    parser.add_argument("--host", default="0.0.0.0", help="FastMCP server host (default: 0.0.0.0)")
-    parser.add_argument("--port", type=int, default=8000, help="FastMCP server port (default: 8000)")
-    parser.add_argument("--blender-host", default=BLENDER_HOST, help="Blender add-on TCP host (default: localhost)")
-    parser.add_argument("--blender-port", type=int, default=BLENDER_PORT, help="Blender add-on TCP port (default: 9876)")
-    parser.add_argument("--ollama-url", default=DEFAULT_OLLAMA_URL, help="Ollama server URL (default: http://localhost:11434)")
-    parser.add_argument("--ollama-model", default=DEFAULT_OLLAMA_MODEL, help="Default Ollama model (default: llama3.2)")
-    parser.add_argument("--transport", choices=["streamable_http", "stdio"], default="streamable_http",
-                        help="MCP transport (default: streamable_http)")
+    parser.add_argument("--host", default="0.0.0.0", help="FastMCP server host")
+    parser.add_argument("--port", type=int, default=8000, help="FastMCP server port")
+    parser.add_argument(
+        "--blender-host", default=BLENDER_HOST, help="Blender add-on TCP host"
+    )
+    parser.add_argument(
+        "--blender-port", type=int, default=BLENDER_PORT, help="Blender add-on TCP port"
+    )
+    parser.add_argument(
+        "--transport",
+        choices=["streamable_http", "http", "stdio"],
+        default="streamable_http",
+        help="MCP transport (streamable_http/http or stdio)",
+    )
+    # LLM provider configuration (startup defaults; can be switched at runtime)
+    parser.add_argument(
+        "--llm-provider", default=None,
+        help="LLM provider: openai, openai_compat, ollama, lmstudio, llamacpp, azure",
+    )
+    parser.add_argument("--llm-base-url", default=None,
+                        help="LLM provider base URL")
+    parser.add_argument("--llm-api-key", default=None,
+                        help="LLM provider API key (optional for local servers)")
+    parser.add_argument("--llm-model", default=None,
+                        help="LLM model name (Azure: deployment name)")
+    parser.add_argument("--llm-extra", default=None,
+                        help="JSON dict of provider-specific extras, e.g. "
+                        '\'{"resource":"r","deployment":"d"}\' for Azure')
     args = parser.parse_args()
 
-    # Apply runtime configuration
+    extra_cfg: Optional[Dict[str, Any]] = None
+    if args.llm_extra:
+        try:
+            extra_cfg = json.loads(args.llm_extra)
+            if not isinstance(extra_cfg, dict):
+                raise ValueError("must be a JSON object")
+        except (json.JSONDecodeError, ValueError) as exc:
+            print(f"error: --llm-extra {exc}", file=sys.stderr)
+            sys.exit(2)
+
     BLENDER_HOST = args.blender_host
     BLENDER_PORT = args.blender_port
-    _state["ollama_url"] = args.ollama_url
-    _state["ollama_model"] = args.ollama_model
+
+    try:
+        if (
+            args.llm_provider
+            or args.llm_base_url
+            or args.llm_model
+            or args.llm_api_key
+            or extra_cfg
+        ):
+            _apply_provider_config(
+                provider=args.llm_provider,
+                base_url=args.llm_base_url,
+                api_key=args.llm_api_key,
+                model=args.llm_model,
+                extra=extra_cfg,
+            )
+        # Normalize provider default from env.
+        _llm_state["provider"] = resolve_provider(_llm_state["provider"])
+    except ProviderError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        sys.exit(2)
 
     logger.info("Starting blender-open-mcp server")
     logger.info("  FastMCP transport : %s", args.transport)
-    if args.transport == "streamable_http":
+    if args.transport in ("streamable_http", "http"):
         logger.info("  FastMCP endpoint  : http://%s:%d", args.host, args.port)
     logger.info("  Blender add-on    : %s:%d", args.blender_host, args.blender_port)
-    logger.info("  Ollama URL        : %s", _state["ollama_url"])
-    logger.info("  Ollama model      : %s", _state["ollama_model"])
+    logger.info("  LLM provider      : %s", _llm_state["provider"])
+    logger.info("  LLM base URL      : %s", _llm_state["base_url"])
+    logger.info("  LLM model         : %s", _llm_state["model"])
+    logger.info("  LLM extra         : %s", _llm_state.get("extra", {}))
 
-    if args.transport == "streamable_http":
-        mcp.run(transport="streamable_http", host=args.host, port=args.port)
+    # fastmcp 4 expects "streamable-http"/"http"/"stdio"; normalize legacy alias.
+    transport = {
+        "streamable_http": "streamable-http",
+        "http": "streamable-http",
+    }.get(args.transport, args.transport)
+    if transport == "stdio":
+        mcp.run(transport="stdio")
     else:
-        mcp.run()  # stdio
+        mcp.run(transport=transport, host=args.host, port=args.port)
 
 
 if __name__ == "__main__":

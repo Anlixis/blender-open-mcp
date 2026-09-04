@@ -16,7 +16,7 @@ Protocol (JSON over TCP, newline-terminated):
 bl_info = {
     "name": "Blender MCP",
     "author": "blender-open-mcp contributors",
-    "version": (2, 0, 0),
+    "version": (4, 0, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar > Blender MCP",
     "description": "MCP server add-on: control Blender via the Model Context Protocol",
@@ -157,13 +157,17 @@ def handle_create_object(params: Dict) -> Any:
     }
     op = prim_dispatch.get(prim_type)
     if op is None:
-        raise ValueError(f"Unknown primitive type '{prim_type}'. Valid: {list(prim_dispatch)}")
+        raise ValueError(
+            f"Unknown primitive type '{prim_type}'. Valid: {list(prim_dispatch)}"
+        )
 
     op(location=location, rotation=rotation, scale=scale)
 
     obj = bpy.context.active_object
     if obj is None:
-        raise RuntimeError("Object was not created (no active object after operator).")
+        raise RuntimeError(
+            "Object was not created (no active object after operator)."
+        )
 
     # Rename if requested
     desired_name = params.get("name")
@@ -230,7 +234,9 @@ def handle_set_material(params: Dict) -> Any:
     if obj is None:
         raise ValueError(f"Object '{obj_name}' not found.")
     if obj.type not in ("MESH", "CURVE", "SURFACE", "FONT", "META"):
-        raise ValueError(f"Object '{obj_name}' is of type '{obj.type}' which does not support materials.")
+        raise ValueError(
+            f"Object '{obj_name}' is of type '{obj.type}' which does not support materials."
+        )
 
     # Create or reuse material
     mat = bpy.data.materials.get(mat_name) or bpy.data.materials.new(name=mat_name)
@@ -266,7 +272,9 @@ def handle_render_image(params: Dict) -> Any:
     # Ensure directory exists
     directory = os.path.dirname(file_path)
     if directory and not os.path.exists(directory):
-        raise ValueError(f"Directory '{directory}' does not exist. Please create it first.")
+        raise ValueError(
+            f"Directory '{directory}' does not exist. Please create it first."
+        )
 
     scene = bpy.context.scene
     scene.render.filepath = file_path
@@ -340,7 +348,9 @@ def handle_download_polyhaven_asset(params: Dict) -> Any:
             download_info = download_info.get(resolution, {})
             download_info = next(iter(download_info.values()), {}) if download_info else {}
     except (KeyError, TypeError) as exc:
-        raise ValueError(f"Could not resolve download URL for '{asset_id}' ({resolution} {file_format}): {exc}")
+        raise ValueError(
+            f"Could not resolve download URL for '{asset_id}' ({resolution} {file_format}): {exc}"
+        )
 
     download_url = download_info.get("url") if isinstance(download_info, dict) else None
     if not download_url:
@@ -364,11 +374,20 @@ def handle_download_polyhaven_asset(params: Dict) -> Any:
         world.use_nodes = True
         env_tex_node = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
         env_tex_node.image = bpy.data.images.load(dest)
-        bg_node = world.node_tree.nodes.get("Background") or world.node_tree.nodes.new("ShaderNodeBackground")
-        world.node_tree.links.new(env_tex_node.outputs["Color"], bg_node.inputs["Color"])
+        bg_node = (
+            world.node_tree.nodes.get("Background")
+            or world.node_tree.nodes.new("ShaderNodeBackground")
+        )
+        world.node_tree.links.new(
+            env_tex_node.outputs["Color"], bg_node.inputs["Color"]
+        )
         return {"hdri_applied": asset_id, "file": dest, "world": world.name}
     else:
-        return {"downloaded": asset_id, "file": dest, "note": "Use blender_set_texture to apply this texture."}
+        return {
+            "downloaded": asset_id,
+            "file": dest,
+            "note": "Use blender_set_texture to apply this texture.",
+        }
 
 
 def handle_set_texture(params: Dict) -> Any:
@@ -412,13 +431,18 @@ def handle_set_texture(params: Dict) -> Any:
     return {"texture_applied": texture_id, "material": mat_name, "object": obj_name}
 
 
-def handle_set_ollama_model(params: Dict) -> Any:
+def handle_set_llm_provider(params: Dict) -> Any:
     # Stored on the server side; this handler is a passthrough acknowledgement
-    return {"ollama_model": params.get("model_name", "")}
+    return {
+        "provider": params.get("provider", ""),
+        "model": params.get("model", ""),
+        "base_url": params.get("base_url", ""),
+    }
 
 
-def handle_set_ollama_url(params: Dict) -> Any:
-    return {"ollama_url": params.get("url", "")}
+def handle_get_llm_provider(_params: Dict) -> Any:
+    # The server handles provider state; this is informational
+    return {"note": "Use blender_get_llm_provider on the MCP server side."}
 
 
 def handle_get_ollama_models(_params: Dict) -> Any:
@@ -442,8 +466,8 @@ HANDLERS = {
     "search_polyhaven_assets":  handle_search_polyhaven_assets,
     "download_polyhaven_asset": handle_download_polyhaven_asset,
     "set_texture":              handle_set_texture,
-    "set_ollama_model":         handle_set_ollama_model,
-    "set_ollama_url":           handle_set_ollama_url,
+    "set_llm_provider":         handle_set_llm_provider,
+    "get_llm_provider":         handle_get_llm_provider,
     "get_ollama_models":        handle_get_ollama_models,
 }
 
@@ -452,7 +476,9 @@ def _dispatch(command_type: str, params: Dict) -> bytes:
     """Route a command to its handler and return encoded response bytes."""
     handler = HANDLERS.get(command_type)
     if handler is None:
-        return _err(f"Unknown command '{command_type}'. Available: {list(HANDLERS)}")
+        return _err(
+            f"Unknown command '{command_type}'. Available: {list(HANDLERS)}"
+        )
     try:
         # Blender operators must run on the main thread; we use a modal timer
         result = handler(params)
@@ -503,7 +529,9 @@ def _server_loop(host: str, port: int) -> None:
         while _server_running:
             try:
                 conn, addr = _server_socket.accept()
-                t = threading.Thread(target=_handle_client, args=(conn, addr), daemon=True)
+                t = threading.Thread(
+                    target=_handle_client, args=(conn, addr), daemon=True
+                )
                 t.start()
             except socket.timeout:
                 continue
@@ -524,7 +552,9 @@ class BLENDER_MCP_OT_StartServer(bpy.types.Operator):
     """Start the Blender MCP TCP server"""
     bl_idname = "blender_mcp.start_server"
     bl_label = "Start MCP Server"
-    bl_description = "Start the TCP server that accepts MCP commands from blender-open-mcp"
+    bl_description = (
+        "Start the TCP server that accepts MCP commands from blender-open-mcp"
+    )
 
     def execute(self, context: bpy.types.Context):
         global _server_thread, _server_running
@@ -540,7 +570,9 @@ class BLENDER_MCP_OT_StartServer(bpy.types.Operator):
             daemon=True,
         )
         _server_thread.start()
-        self.report({"INFO"}, f"MCP server started on {prefs.server_host}:{prefs.server_port}")
+        self.report(
+            {"INFO"}, f"MCP server started on {prefs.server_host}:{prefs.server_port}"
+        )
         return {"FINISHED"}
 
 
@@ -620,6 +652,7 @@ class BLENDER_MCP_PT_Panel(bpy.types.Panel):
         box.label(text="MCP Server: port 8000")
         box.label(text="Blender Add-on: port 9876")
         box.label(text="Ollama: port 11434")
+        box.label(text="LM Studio: port 1234")
 
 
 # ---------------------------------------------------------------------------
@@ -637,8 +670,12 @@ CLASSES = [
 def register():
     for cls in CLASSES:
         bpy.utils.register_class(cls)
-    bpy.types.Scene.blender_mcp_props = bpy.props.PointerProperty(type=BlenderMCPProperties)
-    print("[Blender MCP] Add-on registered. Open the N-sidebar in 3D View → Blender MCP.")
+    bpy.types.Scene.blender_mcp_props = bpy.props.PointerProperty(
+        type=BlenderMCPProperties
+    )
+    print(
+        "[Blender MCP] Add-on registered. Open the N-sidebar in 3D View → Blender MCP."
+    )
 
 
 def unregister():

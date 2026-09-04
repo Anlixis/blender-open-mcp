@@ -1,8 +1,8 @@
 """
 Tests for the Blender MCP add-on.
 =================================
-Note: The addon.py architecture changed in v2.0.0 from a BlenderMCPServer class
-to a module-level TCP server. These tests have been updated accordingly.
+Note: The addon.py architecture changed in v4.0.0 to support provider-agnostic
+LLM backends and runtime provider switching. These tests reflect that.
 """
 
 import sys
@@ -42,7 +42,9 @@ class TestAddonHandlers(unittest.TestCase):
         self.mock_scene.objects = []
 
         addon.bpy.context.scene = self.mock_scene
-        addon.bpy.data.objects = {}
+        mock_objects = MagicMock()
+        mock_objects.get.return_value = None  # default: object not found
+        addon.bpy.data.objects = mock_objects
 
     def test_handle_get_scene_info_empty_scene(self):
         """Test scene info handler with empty scene."""
@@ -135,8 +137,8 @@ class TestAddonHandlers(unittest.TestCase):
             "search_polyhaven_assets",
             "download_polyhaven_asset",
             "set_texture",
-            "set_ollama_model",
-            "set_ollama_url",
+            "set_llm_provider",
+            "get_llm_provider",
             "get_ollama_models",
         ]
         for handler in expected_handlers:
@@ -210,7 +212,3 @@ class TestAddonPolyHaven(unittest.TestCase):
         result = addon.handle_search_polyhaven_assets({"asset_type": "textures"})
         self.assertEqual(result["total"], 2)
         self.assertEqual(len(result["assets"]), 2)
-
-
-if __name__ == '__main__':
-    unittest.main()

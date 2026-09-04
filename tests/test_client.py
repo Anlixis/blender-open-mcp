@@ -99,7 +99,11 @@ class TestCallTool:
         tool_resp = _make_mock_response(["Scene: Default"])
 
         client._http = MagicMock()
-        client._http.post = AsyncMock(side_effect=[init_resp, MagicMock(status_code=200, text="", headers={}), tool_resp])
+        client._http.post = AsyncMock(side_effect=[
+            init_resp,
+            MagicMock(status_code=200, text="", headers={}),
+            tool_resp,
+        ])
 
         result = await client.call_tool("blender_get_scene_info")
         assert "Scene" in result or isinstance(result, str)
@@ -297,7 +301,9 @@ class TestSessionHandling:
 
         mock_resp = MagicMock()
         mock_resp.status_code = 200
-        mock_resp.text = json.dumps({"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}})
+        mock_resp.text = json.dumps(
+            {"jsonrpc": "2.0", "id": 1, "result": {"protocolVersion": "2024-11-05"}}
+        )
         mock_resp.headers = {"Mcp-Session-Id": "abc-123-xyz"}
 
         client._http = MagicMock()

@@ -1,187 +1,112 @@
-# blender-open-mcp
+# Blender Open MCP
 
-**Open Models MCP for Blender3D using Ollama**
+Local-first **Model Context Protocol (MCP)** server for controlling a live
+Blender session from AI agents, with a **provider-agnostic LLM backend**:
 
-Control Blender 3D with natural language prompts via local AI models. Built on the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/), connecting Claude, Cursor, or any MCP client to Blender through a local Ollama LLM.
+- **Ollama**
+- **LM Studio**
+- **llama.cpp** server
+- **OpenAI** (and every OpenAI-compatible endpoint: vLLM, TGI, OpenRouter,
+  Groq, Together, Azure AI Foundry via its OpenAI-compatible surface, …)
+- any server that speaks `POST /chat/completions` with an optional base URL
+  and API key
 
----
-
-## Architecture
+Providers are configured at startup (CLI flags or environment variables) and
+can be **switched at runtime** through MCP tools, so an agent can hop between
+backends without restarting the server.
 
 ```
-MCP Client (Claude/Cursor/CLI)
-         │ HTTP / stdio
-         ▼
-┌─────────────────────┐
-│   FastMCP Server    │  ← server.py  (port 8000)
-│   blender-open-mcp  │
-└─────────────────────┘
-    │ TCP socket           │ HTTP
-    ▼                      ▼
-┌──────────────┐    ┌─────────────┐
-│  Blender     │    │   Ollama    │  (port 11434)
-│  Add-on      │    │  llama3.2   │
-│  addon.py    │    │  gemma3...  │
-│  (port 9876) │    └─────────────┘
-└──────────────┘
-       │ bpy
-       ▼
-  Blender Python API
-```
-
-Three independent processes:
-
-- **FastMCP Server** (`server.py`): Exposes MCP tools over HTTP or stdio
-- **Blender Add-on** (`addon.py`): TCP socket server running inside Blender
-- **Ollama**: Local LLM serving natural language queries
-
----
-
-## Installation
-
-### Prerequisites
-
-| Dependency | Version | Install |
-|-----------|---------|---------|
-| Blender | 3.0+ | [blender.org](https://www.blender.org/download/) |
-| Python | 3.10+ | System or [python.org](https://www.python.org/) |
-| Ollama | Latest | [ollama.com](https://ollama.com/) |
-| uv | Latest | `pip install uv` |
-
-### 1. Clone and set up
-
-```bash
-git clone https://github.com/dhakalnirajan/blender-open-mcp.git
-cd blender-open-mcp
-
-# Create virtual environment and install
-uv venv
-source .venv/bin/activate   # Linux / macOS
-# .venv\Scripts\activate    # Windows
-
-uv pip install -e .
-```
-
-### 2. Install the Blender Add-on
-
-1. Open Blender
-2. Go to **Edit → Preferences → Add-ons → Install...**
-3. Select `addon.py` from the repository root
-4. Enable **"Blender MCP"**
-5. Open the **3D Viewport**, press **N**, find the **Blender MCP** panel
-6. Click **"Start MCP Server"** (default port: 9876)
-
-### 3. Pull an Ollama model
-
-   ```bash
-   ollama pull ollama run llama3.2
-   ```
-
-   *(Other models like **`Gemma3`** can also be used.)*
-
-## Setup
-
-1. **Start the Ollama Server:** Ensure Ollama is running in the background.
-
-2. **Start the MCP Server:**
-
-```bash
-blender-mcp
-```
-
-Custom options:
-
-```bash
-blender-mcp \
-  --host 127.0.0.1 \
-  --port 8000 \
-  --blender-host localhost \
-  --blender-port 9876 \
-  --ollama-url http://localhost:11434 \
-  --ollama-model llama3.2
-```
-
-For stdio transport (Claude Desktop, Cursor):
-
-```bash
-blender-mcp --transport stdio
+MCP Client ──▶ FastMCP Server ──▶ (TCP 9876) ──▶ Blender add-on (addon.py) ──▶ bpy
+                  │
+                  └──────────────▶ (HTTP) ──▶ LLM provider (Ollama / LM Studio /
+                                               llama.cpp / OpenAI-compatible / Azure)
 ```
 
 ---
 
-## Usage
+## Repository layout
 
-### MCP Client CLI
+| Path | Purpose |
+| --- | --- |
+| `addon.py` | Single-file Blender add-on: TCP server + scene/render/PolyHaven handlers + sidebar panel |
+| `src/blender_open_mcp/server.py` | MCP server: Blender tools, PolyHaven tools, LLM prompt + provider tools |
+| `src/blender_open_mcp/llm.py` | Provider-agnostic LLM layer (registry, adapters, model listing) |
+| `src/blender_open_mcp/client/` | Canonical async MCP client + CLI |
+| `client/` | Thin compat wrapper so `from client import …` keeps working from source |
+| `tests/` | pytest suites (server, client, addon) |
+
+---
+
+## Quick start
+
+### 1. Install
+
+Requires Python ≥ 3.10.
 
 ```bash
-# Interactive shell
-blender-mcp-client interactive
-
-# One-shot scene info
-blender-mcp-client scene
-
-# Call a specific tool
-blender-mcp-client tool blender_get_scene_info
-blender-mcp-client tool blender_create_object '{"primitive_type": "SPHERE", "name": "MySphere"}'
-
-# Natural language prompt
-blender-mcp-client prompt "Create a metallic sphere at position 0, 0, 2"
-
-# List all available tools
-blender-mcp-client tools
+python -m venv .venv
+.venv/Scripts/pip install -e ".[dev]"   # Windows (bash/PowerShell)
+# or: source .venv/bin/activate && pip install -e ".[dev]"   # macOS/Linux
 ```
 
-### Python API
+### 2. Enable the Blender add-on
 
-```python
-import asyncio
-from client.client import BlenderMCPClient
+1. Open Blender.
+2. `Edit → Preferences → Add-ons → Install…`, choose `addon.py`.
+3. Enable **Blender MCP**.
+4. In the 3D Viewport press `N`, open the **Blender MCP** tab and click
+   **Start MCP Server** (listens on `localhost:9876` by default).
 
-async def demo():
-    async with BlenderMCPClient("http://localhost:8000") as client:
-        # Scene inspection
-        print(await client.get_scene_info())
+### 3. Start the MCP server
 
-        # Create objects
-        await client.create_object("CUBE", name="MyCube", location=(0, 0, 0))
-        await client.create_object("SPHERE", name="MySphere", location=(3, 0, 0))
+Default LLM backend is Ollama:
 
-        # Apply materials
-        await client.set_material("MyCube", "GoldMat", color=[1.0, 0.84, 0.0, 1.0])
-
-        # Move objects
-        await client.modify_object("MySphere", location=(3, 0, 2), scale=(1.5, 1.5, 1.5))
-
-        # PolyHaven assets
-        categories = await client.get_polyhaven_categories("textures")
-        await client.download_polyhaven_asset("brick_wall_001", resolution="2k")
-        await client.set_texture("MyCube", "brick_wall_001")
-
-        # Render
-        await client.render_image("/tmp/my_render.png")
-
-        # AI assistance
-        response = await client.ai_prompt(
-            "Write bpy code to add a sun light pointing down"
-        )
-        print(response)
-
-        # Execute the generated code
-        await client.execute_code(response)
-
-asyncio.run(demo())
+```bash
+blender-mcp                          # Ollama at http://localhost:11434, model llama3.2
 ```
 
-### Claude Desktop / Cursor Integration
+Or pick a different backend at startup:
 
-Add to your `mcp.json` (or `~/.cursor/mcp.json`):
+```bash
+# LM Studio (OpenAI-compatible, default localhost:1234/v1)
+blender-mcp --llm-provider lmstudio --llm-model "local-model"
+
+# llama.cpp server (default localhost:8080/v1)
+blender-mcp --llm-provider llamacpp --llm-model qwen2.5-coder
+
+# OpenAI-compatible generic endpoint
+blender-mcp --llm-provider openai_compat --llm-base-url http://my-server:8000/v1 \
+            --llm-api-key sk-... --llm-model my-model
+
+# OpenAI
+blender-mcp --llm-provider openai --llm-api-key "$OPENAI_API_KEY" --llm-model gpt-4o-mini
+
+# Azure AI Foundry / Azure OpenAI
+blender-mcp --llm-provider azure --llm-api-key "$AZURE_API_KEY" \
+            --llm-base-url https://my-resource.openai.azure.com \
+            --llm-model my-deployment \
+            --llm-extra '{"resource":"my-resource","deployment":"my-deployment","api_version":"2024-06-01"}'
+```
+
+Environment variables are honored: `BLENDER_OPEN_MCP_PROVIDER`,
+`BLENDER_OPEN_MCP_BASE_URL`, `BLENDER_OPEN_MCP_MODEL`,
+`BLENDER_OPEN_MCP_API_KEY`.
+
+Other useful flags: `--host`, `--port` (MCP endpoint, default `0.0.0.0:8000`),
+`--blender-host`, `--blender-port`, `--transport streamable_http|http|stdio`.
+
+### 4. Register with an MCP client
+
+Point your MCP client at `http://localhost:8000/mcp` (streamable HTTP) or run
+`blender-mcp --transport stdio`.
+
+Example Claude/Cursor-style config:
 
 ```json
 {
   "mcpServers": {
-    "blender-open-mcp": {
-      "command": "blender-mcp",
-      "args": ["--transport", "stdio"]
+    "blender": {
+      "url": "http://localhost:8000/mcp"
     }
   }
 }
@@ -189,71 +114,180 @@ Add to your `mcp.json` (or `~/.cursor/mcp.json`):
 
 ---
 
-## Available Tools
+## Available MCP tools
 
-| Tool | Description | Modifies Blender |
-|------|-------------|-----------------|
-| `blender_get_scene_info` | Full scene summary: objects, camera, render settings | No |
-| `blender_get_object_info` | Detailed object info: transforms, materials, mesh stats | No |
-| `blender_create_object` | Add a primitive mesh (CUBE, SPHERE, CYLINDER, ...) | Yes |
-| `blender_modify_object` | Change location, rotation, scale, visibility | Yes |
-| `blender_delete_object` | Remove an object from the scene | Yes ⚠️ |
-| `blender_set_material` | Create and assign a Principled BSDF material | Yes |
-| `blender_render_image` | Render current scene to a file | Yes |
-| `blender_execute_code` | Run arbitrary Python/bpy code in Blender | Yes ⚠️ |
-| `blender_get_polyhaven_categories` | List PolyHaven asset categories | No |
-| `blender_search_polyhaven_assets` | Search PolyHaven library with pagination | No |
-| `blender_download_polyhaven_asset` | Download & import a PolyHaven asset | Yes |
-| `blender_set_texture` | Apply a downloaded PolyHaven texture to an object | Yes |
-| `blender_ai_prompt` | Send a natural language prompt to Ollama | No |
-| `blender_get_ollama_models` | List available local Ollama models | No |
-| `blender_set_ollama_model` | Switch the active Ollama model | No |
-| `blender_set_ollama_url` | Update the Ollama server URL | No |
+**Scene / object control** (forwarded to the Blender add-on over TCP):
+`blender_get_scene_info`, `blender_get_object_info`, `blender_create_object`,
+`blender_modify_object`, `blender_delete_object`, `blender_set_material`,
+`blender_render_image`, `blender_execute_code`.
+
+**PolyHaven assets:** `blender_get_polyhaven_categories`,
+`blender_search_polyhaven_assets`, `blender_download_polyhaven_asset`,
+`blender_set_texture`.
+
+**LLM / provider control:**
+- `blender_ai_prompt` – send a prompt to the active backend (per-call
+  `provider`/`base_url`/`model`/`api_key` overrides supported).
+- `blender_get_llm_provider` – show active provider config (API key masked).
+- `blender_set_llm_provider` – switch/configure the backend at runtime.
+- `blender_list_llm_models` – list models (Ollama `/api/tags` or
+  OpenAI-compatible `/models`).
+
+**Legacy aliases:** `blender_set_ollama_model`, `blender_set_ollama_url`,
+`blender_get_ollama_models` keep old Ollama-only clients working.
+
+### Runtime provider switching (examples)
+
+```text
+# Switch to LM Studio
+tool blender_set_llm_provider {"provider":"lmstudio","base_url":"http://localhost:1234/v1","model":"local-model"}
+
+# Switch to llama.cpp
+tool blender_set_llm_provider {"provider":"llamacpp","base_url":"http://localhost:8080/v1"}
+
+# Back to Ollama
+tool blender_set_llm_provider {"provider":"ollama","base_url":"http://localhost:11434","model":"llama3.2"}
+```
+
+#### Azure AI Foundry (worked example)
+
+Azure's OpenAI-compatible endpoint is deployment-scoped, so three values from
+your Azure AI Foundry project are required — all of them go into the `extra`
+parameter, and the model you name in `model` must match the deployment name:
+
+1. **Resource name** — in the Azure portal, open your resource (e.g.
+   *Azure OpenAI* or *AI Foundry project*) and take the short name from its
+   endpoint URL: `https://<resource>.openai.azure.com/...`.
+2. **Deployment name** — on the *Deployments* page, e.g. `gpt-4o-mini`.
+   This is what you pass as `model` (it is *not* the base model name).
+3. **API key** — on the resource's *Keys and Endpoint* page.
+4. **API version** (optional) — e.g. `2024-06-01` (the adapter defaults to it).
+
+Switch to Azure at runtime with a single call (CLI form):
+
+```bash
+blender-mcp-client --host http://localhost:8000 tool blender_set_llm_provider \
+  '{"provider":"azure","api_key":"YOUR_AZURE_API_KEY","model":"gpt-4o-mini",' \
+  '"extra":{"resource":"my-openai-resource","deployment":"gpt-4o-mini","api_version":"2024-06-01"}}'
+```
+
+The same call through the Python API:
+
+```python
+import asyncio
+from blender_open_mcp.client.client import BlenderMCPClient
+
+async def main():
+    async with BlenderMCPClient("http://localhost:8000") as c:
+        # Switch to Azure AI Foundry
+        print(await c.set_llm_provider(
+            provider="azure",
+            api_key="YOUR_AZURE_API_KEY",
+            model="gpt-4o-mini",
+            extra={
+                "resource": "my-openai-resource",
+                "deployment": "gpt-4o-mini",
+                "api_version": "2024-06-01",
+            },
+        ))
+        # Confirm the active config (API key is masked)
+        print(await c.get_llm_provider())
+        # Use it
+        print(await c.ai_prompt("Create a red cube at the origin"))
+
+asyncio.run(main())
+```
+
+What the adapter does with those values — it builds the deployment-scoped
+request and sends the key in the `api-key` header:
+
+```
+POST https://my-openai-resource.openai.azure.com/openai/deployments/gpt-4o-mini/chat/completions?api-version=2024-06-01
+api-key: YOUR_AZURE_API_KEY
+{"model": "gpt-4o-mini", "messages": [...], "stream": false}
+```
+
+Notes:
+- You may omit `base_url` entirely (the placeholder
+  `https://RESOURCE.openai.azure.com` is filled in from `extra.resource`) or
+  pass the full base URL explicitly.
+- If you use an AI Foundry **serverless model endpoint** (the
+  `*.services.ai.azure.com/models` surface) instead of a deployment-scoped
+  resource, point `provider` at the generic OpenAI-compatible adapter with the
+  serverless base URL: `provider="openai_compat"`,
+  `base_url="https://<resource>.services.ai.azure.com/models"`.
+- The same configuration can be applied at startup instead of at runtime:
+
+```bash
+blender-mcp --llm-provider azure \
+  --llm-api-key "$AZURE_API_KEY" \
+  --llm-model gpt-4o-mini \
+  --llm-extra '{"resource":"my-openai-resource","deployment":"gpt-4o-mini","api_version":"2024-06-01"}'
+```
+```
 
 ---
 
-## Default Ports
+## Client CLI
 
-| Service | Port |
-|---------|------|
-| FastMCP Server | 8000 |
-| Blender Add-on (TCP) | 9876 |
-| Ollama | 11434 |
+```bash
+blender-mcp-client --host http://localhost:8000 tools
+blender-mcp-client --host http://localhost:8000 tool blender_get_scene_info
+blender-mcp-client --host http://localhost:8000 tool blender_set_llm_provider '{"provider":"lmstudio"}'
+blender-mcp-client --host http://localhost:8000 prompt "Create a metallic sphere at 0,0,2"
+blender-mcp-client --host http://localhost:8000 interactive
+```
+
+As a library:
+
+```python
+import asyncio
+from blender_open_mcp.client.client import BlenderMCPClient
+
+async def main():
+    async with BlenderMCPClient("http://localhost:8000") as c:
+        print(await c.get_scene_info())
+        await c.create_object("SPHERE", location=(0, 0, 2))
+        print(await c.ai_prompt("What should I build next?"))
+
+asyncio.run(main())
+```
+
+---
+
+## Provider layer internals
+
+`src/blender_open_mcp/llm.py` keeps a registry of provider specs and routes
+every request through one chat helper:
+
+- **OpenAI-style** providers post to `<base_url>/chat/completions` with a
+  `Bearer` token when an API key is set, and parse
+  `choices[0].message.content`.
+- **Ollama** posts to `/api/chat` natively (or to its `/v1/chat/completions`
+  surface when the base URL ends in `/v1`).
+- **Azure** posts to
+  `https://<resource>.openai.azure.com/openai/deployments/<deployment>/chat/completions?api-version=…`
+  using the `api-key` header.
+- **Model listing**: Ollama `/api/tags`, others `/models` (Azure deployments
+  are managed in the portal and not listed).
+
+Add new backends by inserting an entry in `PROVIDERS` (plus an alias in
+`PROVIDER_ALIASES`); nothing else changes.
 
 ---
 
 ## Development
 
 ```bash
-# Install dev dependencies
-uv pip install -e ".[dev]"
-
-# Run tests
-pytest tests/ -v
-
-# Type checking
-mypy src/
-
-# Linting
-ruff check src/ client/
+.venv/Scripts/python -m pytest tests -q
 ```
 
----
+The suites mock `bpy` (addon tests), `httpx` (provider/PolyHaven routing),
+and the MCP client wire format, so they run without Blender or a live LLM.
 
-## Troubleshooting
+## Notes / known gaps
 
-| Problem | Solution |
-|---------|----------|
-| `Cannot connect to Blender add-on` | Open Blender → N-sidebar → Blender MCP → **Start MCP Server** |
-| `Cannot connect to Ollama` | Run `ollama serve` in a terminal |
-| `Object not found` | Check exact object name via `blender_get_scene_info` |
-| `Render fails` | Ensure the output directory exists and is writable |
-| `PolyHaven download fails` | Check internet connection; try a lower resolution |
-
----
-
-## License
-
-MIT License. See [LICENSE](LICENSE) for details.
-
-This project is not affiliated with the Blender Foundation.
+- Tests exercise the server without a live Blender; run them against a real
+  Blender session to validate `addon.py` end to end.
+- See `ARCHITECTURE.md` for the component diagram and `AGENTS.md` for
+  contributor conventions.

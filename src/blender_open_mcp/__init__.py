@@ -1,9 +1,14 @@
-"""Blender integration through the Model Context Protocol."""
+"""
+blender_open_mcp - provider-agnostic MCP server for Blender.
 
-__version__ = "2.0.0"
+Supported LLM backends:
+- OpenAI-compatible REST APIs (OpenAI, Azure AI Foundry, LM Studio, llama.cpp server, etc.)
+- Ollama via both chat/completions and native Ollama endpoints
+- Runtime provider switching via MCP tools
+"""
 
-# The primary public interface is the FastMCP server.
-# Import from blender_open_mcp.server directly:
-#   from blender_open_mcp.server import mcp, main
-# For the client, use the separate client module:
-#   from client.client import BlenderMCPClient
+from __future__ import annotations
+
+from .server import main
+
+__all__ = ["main"]
