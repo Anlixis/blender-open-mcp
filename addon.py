@@ -905,12 +905,39 @@ def handle_gn_set_modifier_input(params: Dict) -> Any:
     )
     proxy = SimpleNamespace(bl_idname=socket_type)
     value = _coerce_socket_value(proxy, params.get("value"))
+
+    # Blender 5.2 moved Geometry Nodes modifier interface values from
+    # ID-properties (mod["Socket_2"]) to proper runtime RNA properties:
+    # mod.properties.inputs.Socket_2.value
+    # Keep the ID-property path as a fallback for Blender <= 5.1.
+    assigned_value = value
+    storage = "id_property"
     try:
-        mod[identifier] = value
+        properties = getattr(mod, "properties", None)
+        inputs = getattr(properties, "inputs", None) if properties is not None else None
+        runtime_input = None
+        if inputs is not None:
+            runtime_input = getattr(inputs, identifier, None)
+            if runtime_input is None:
+                try:
+                    runtime_input = inputs[identifier]
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    runtime_input = None
+
+        if runtime_input is not None and hasattr(runtime_input, "value"):
+            runtime_input.value = value
+            assigned_value = runtime_input.value
+            storage = "rna"
+        else:
+            mod[identifier] = value
+            assigned_value = mod[identifier]
+
+        # The RNA path normally triggers updates itself, but explicitly tag the
+        # object so both old and new Blender versions refresh the evaluated GN.
         obj.update_tag()
     except Exception as exc:
         raise ValueError(
-            f"Could not set modifier input '{socket_selector}' to "
+            f"Could not set modifier input '{socket_selector}' ({identifier}) to "
             f"{params.get('value')!r}: {exc}"
         ) from exc
     return {
@@ -918,7 +945,8 @@ def handle_gn_set_modifier_input(params: Dict) -> Any:
         "modifier": modifier_name,
         "input": getattr(socket, "name", socket_selector),
         "identifier": identifier,
-        "value": _json_safe_value(value),
+        "value": _json_safe_value(assigned_value),
+        "storage": storage,
     }
 
 
