@@ -1469,7 +1469,6 @@ def handle_viewport_screenshot(params: Dict) -> Any:
             screen=screen,
             area=area,
             region=region,
-            space_data=space,
         ):
             result = bpy.ops.render.opengl(write_still=True, view_context=True)
         if "FINISHED" not in result:
