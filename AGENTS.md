@@ -48,6 +48,15 @@ startup (CLI/env) and switched at runtime through MCP tools.
   `blender_list_llm_models` lists models. Ollama-only aliases
   (`blender_set_ollama_model`, `blender_set_ollama_url`,
   `blender_get_ollama_models`) are thin wrappers for backward compatibility.
+- **Generic node editing.** New work that applies equally to Geometry,
+  Material, World, or Compositor trees should use `blender_node_*`; keep
+  `blender_gn_*` as compatibility/convenience tools for GN-specific concepts
+  such as modifier inputs and group interface sockets.
+- **Safe multi-step edits.** Use `blender_transaction_*` only for typed
+  direct-data mutations. Do not add operator-heavy commands to the transaction
+  safe set without proving rollback semantics.
+- **Visual feedback.** `blender_viewport_screenshot` should return a native
+  MCP image via FastMCP `Image` when the file is locally accessible.
 - **Tool-first procedural editing.** Prefer `blender_gn_*` and modifier tools
   over `blender_execute_code`. Geometry Nodes changes should be incremental:
   inspect → edit → validate → inspect. Arbitrary Python remains an advanced
