@@ -457,6 +457,132 @@ class BlenderMCPClient:
             args["target"] = target
         return await self.call_tool("blender_node_get_tree", args)
 
+    async def node_add(
+        self,
+        tree_type: str,
+        node_type: str,
+        target: Optional[str] = None,
+        name: Optional[str] = None,
+        label: Optional[str] = None,
+        location: Optional[List[float]] = None,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Add a node to a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_type": node_type,
+        }
+        if target is not None:
+            args["target"] = target
+        if name:
+            args["name"] = name
+        if label is not None:
+            args["label"] = label
+        if location is not None:
+            args["location"] = location
+        if properties:
+            args["properties"] = properties
+        return await self.call_tool("blender_node_add", args)
+
+    async def node_remove(
+        self,
+        tree_type: str,
+        node_name: str,
+        target: Optional[str] = None,
+    ) -> str:
+        """Remove a node from a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_name": node_name,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_remove", args)
+
+    async def node_connect(
+        self,
+        tree_type: str,
+        from_node: str,
+        from_socket: Any,
+        to_node: str,
+        to_socket: Any,
+        target: Optional[str] = None,
+        replace: bool = True,
+    ) -> str:
+        """Connect sockets in a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "from_node": from_node,
+            "from_socket": from_socket,
+            "to_node": to_node,
+            "to_socket": to_socket,
+            "replace": replace,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_connect", args)
+
+    async def node_disconnect(
+        self,
+        tree_type: str,
+        to_node: str,
+        to_socket: Any,
+        target: Optional[str] = None,
+        from_node: Optional[str] = None,
+        from_socket: Any = None,
+    ) -> str:
+        """Disconnect sockets in a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "to_node": to_node,
+            "to_socket": to_socket,
+        }
+        if target is not None:
+            args["target"] = target
+        if from_node:
+            args["from_node"] = from_node
+        if from_socket is not None:
+            args["from_socket"] = from_socket
+        return await self.call_tool("blender_node_disconnect", args)
+
+    async def node_set_input(
+        self,
+        tree_type: str,
+        node_name: str,
+        input_socket: Any,
+        value: Any,
+        target: Optional[str] = None,
+    ) -> str:
+        """Set a generic node input default value."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_name": node_name,
+            "input_socket": input_socket,
+            "value": value,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_set_input", args)
+
+    async def node_set_property(
+        self,
+        tree_type: str,
+        node_name: str,
+        property_name: str,
+        value: Any,
+        target: Optional[str] = None,
+    ) -> str:
+        """Set a generic node RNA property."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_name": node_name,
+            "property_name": property_name,
+            "value": value,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_set_property", args)
+
     async def checkpoint(self, label: str = "MCP checkpoint") -> str:
         """Create a named Blender undo checkpoint."""
         return await self.call_tool("blender_checkpoint", {"label": label})
