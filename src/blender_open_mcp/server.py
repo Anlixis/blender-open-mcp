@@ -1372,7 +1372,7 @@ async def blender_transaction_rollback() -> str:
     name="blender_viewport_screenshot",
     annotations={
         "title": "Capture Blender 3D Viewport",
-        "readOnlyHint": True,
+        "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": False,
         "openWorldHint": False,
