@@ -136,7 +136,7 @@ class BlenderMCPClient:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "clientInfo": {"name": "blender-open-mcp-client", "version": "4.1.0"},
+                "clientInfo": {"name": "blender-open-mcp-client", "version": "4.2.0"},
             },
         }
         try:
@@ -432,6 +432,200 @@ class BlenderMCPClient:
         return await self.call_tool(
             "blender_gn_validate", {"node_group": node_group}
         )
+
+    async def node_create_tree(
+        self, tree_type: str, target: Optional[str] = None
+    ) -> str:
+        """Create or enable a generic Blender node tree."""
+        args: Dict[str, Any] = {"tree_type": tree_type}
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_create_tree", args)
+
+    async def node_get_tree(
+        self,
+        tree_type: str,
+        target: Optional[str] = None,
+        include_sockets: bool = True,
+    ) -> str:
+        """Inspect a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "include_sockets": include_sockets,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_get_tree", args)
+
+    async def node_add(
+        self,
+        tree_type: str,
+        node_type: str,
+        target: Optional[str] = None,
+        name: Optional[str] = None,
+        label: Optional[str] = None,
+        location: Optional[List[float]] = None,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Add a node to a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_type": node_type,
+        }
+        if target is not None:
+            args["target"] = target
+        if name:
+            args["name"] = name
+        if label is not None:
+            args["label"] = label
+        if location is not None:
+            args["location"] = location
+        if properties:
+            args["properties"] = properties
+        return await self.call_tool("blender_node_add", args)
+
+    async def node_remove(
+        self,
+        tree_type: str,
+        node_name: str,
+        target: Optional[str] = None,
+    ) -> str:
+        """Remove a node from a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_name": node_name,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_remove", args)
+
+    async def node_connect(
+        self,
+        tree_type: str,
+        from_node: str,
+        from_socket: Any,
+        to_node: str,
+        to_socket: Any,
+        target: Optional[str] = None,
+        replace: bool = True,
+    ) -> str:
+        """Connect sockets in a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "from_node": from_node,
+            "from_socket": from_socket,
+            "to_node": to_node,
+            "to_socket": to_socket,
+            "replace": replace,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_connect", args)
+
+    async def node_disconnect(
+        self,
+        tree_type: str,
+        to_node: str,
+        to_socket: Any,
+        target: Optional[str] = None,
+        from_node: Optional[str] = None,
+        from_socket: Any = None,
+    ) -> str:
+        """Disconnect sockets in a generic Blender node tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "to_node": to_node,
+            "to_socket": to_socket,
+        }
+        if target is not None:
+            args["target"] = target
+        if from_node:
+            args["from_node"] = from_node
+        if from_socket is not None:
+            args["from_socket"] = from_socket
+        return await self.call_tool("blender_node_disconnect", args)
+
+    async def node_set_input(
+        self,
+        tree_type: str,
+        node_name: str,
+        input_socket: Any,
+        value: Any,
+        target: Optional[str] = None,
+    ) -> str:
+        """Set a generic node input default value."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_name": node_name,
+            "input_socket": input_socket,
+            "value": value,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_set_input", args)
+
+    async def node_set_property(
+        self,
+        tree_type: str,
+        node_name: str,
+        property_name: str,
+        value: Any,
+        target: Optional[str] = None,
+    ) -> str:
+        """Set a generic node RNA property."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "node_name": node_name,
+            "property_name": property_name,
+            "value": value,
+        }
+        if target is not None:
+            args["target"] = target
+        return await self.call_tool("blender_node_set_property", args)
+
+    async def checkpoint(self, label: str = "MCP checkpoint") -> str:
+        """Create a named Blender undo checkpoint."""
+        return await self.call_tool("blender_checkpoint", {"label": label})
+
+    async def undo(self, steps: int = 1) -> str:
+        """Undo Blender history steps."""
+        return await self.call_tool("blender_undo", {"steps": steps})
+
+    async def redo(self, steps: int = 1) -> str:
+        """Redo Blender history steps."""
+        return await self.call_tool("blender_redo", {"steps": steps})
+
+    async def transaction_begin(self, label: str = "MCP transaction") -> str:
+        """Begin a rollback-capable typed-edit transaction."""
+        return await self.call_tool("blender_transaction_begin", {"label": label})
+
+    async def transaction_status(self) -> str:
+        """Return the current MCP transaction state."""
+        return await self.call_tool("blender_transaction_status")
+
+    async def transaction_commit(self) -> str:
+        """Commit the active MCP transaction."""
+        return await self.call_tool("blender_transaction_commit")
+
+    async def transaction_rollback(self) -> str:
+        """Rollback the active MCP transaction."""
+        return await self.call_tool("blender_transaction_rollback")
+
+    async def viewport_screenshot(
+        self,
+        file_path: Optional[str] = None,
+        shading: Optional[str] = None,
+        show_overlays: Optional[bool] = None,
+    ) -> str:
+        """Capture a 3D viewport; CLI clients receive the metadata text block."""
+        args: Dict[str, Any] = {}
+        if file_path:
+            args["file_path"] = file_path
+        if shading:
+            args["shading"] = shading
+        if show_overlays is not None:
+            args["show_overlays"] = show_overlays
+        return await self.call_tool("blender_viewport_screenshot", args)
 
     async def set_material(
         self,

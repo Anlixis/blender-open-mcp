@@ -134,6 +134,29 @@ The Geometry Nodes tools are intentionally typed and incremental: agents can
 inspect a graph, make a small edit, validate it, and inspect again instead of
 sending a large arbitrary Python script through `blender_execute_code`.
 
+**Generic Node API (v4.2):**
+`blender_node_create_tree`, `blender_node_get_tree`, `blender_node_add`,
+`blender_node_remove`, `blender_node_connect`, `blender_node_disconnect`,
+`blender_node_set_input`, `blender_node_set_property`.
+
+Supported `tree_type` values: `GEOMETRY`, `MATERIAL`, `WORLD`,
+`COMPOSITOR`. This lets one agent workflow edit procedural geometry, shader
+materials, world shading, and scene compositor graphs using the same tool
+shape.
+
+**Undo / transactions / visual feedback (v4.2):**
+`blender_checkpoint`, `blender_undo`, `blender_redo`,
+`blender_transaction_begin`, `blender_transaction_status`,
+`blender_transaction_commit`, `blender_transaction_rollback`,
+`blender_viewport_screenshot`.
+
+Transactions are deliberately restricted to typed direct-data edits. While a
+transaction is active, operator-heavy commands such as object creation,
+rendering, PolyHaven import, viewport capture, and arbitrary Python execution
+are blocked. This keeps rollback predictable. The screenshot tool captures the
+largest visible 3D viewport and returns an MCP image content block when the
+MCP server can access Blender's generated PNG path.
+
 **PolyHaven assets:** `blender_get_polyhaven_categories`,
 `blender_search_polyhaven_assets`, `blender_download_polyhaven_asset`,
 `blender_set_texture`.
@@ -153,6 +176,7 @@ sending a large arbitrary Python script through `blender_execute_code`.
 - `blender_build_scene` – guided plan for building a scene from a description.
 - `blender_review_scene` – read-only inspection workflow.
 - `blender_build_geometry_nodes` – tool-first Geometry Nodes editing workflow.
+- `blender_safe_node_edit` – transaction + generic nodes + visual verification.
 - `blender_configure_llm` – provider-switching instructions with examples.
 
 Prompts are registered in `src/blender_open_mcp/prompts.py`.
@@ -180,6 +204,22 @@ On Blender 5.2, exposed Geometry Nodes modifier inputs use the new RNA API
 path automatically and falls back to legacy ID-properties for Blender 5.1 and
 earlier.
 
+### Safe v4.2 node-edit workflow
+
+For a multi-step material/world/compositor/geometry edit:
+
+1. `blender_node_get_tree`
+2. `blender_transaction_begin`
+3. Make changes with `blender_node_*` typed tools
+4. Inspect again with `blender_node_get_tree`
+5. `blender_transaction_commit` if correct, otherwise
+   `blender_transaction_rollback`
+6. After the transaction closes, call `blender_viewport_screenshot` for a
+   visual check when the result affects the scene
+
+The screenshot implementation uses Blender's viewport/window screenshot API,
+so Blender must have a visible `VIEW_3D` area; it is not available in pure
+background mode.
 
 ### Runtime provider switching (examples)
 

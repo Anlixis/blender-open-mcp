@@ -88,6 +88,13 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
     `blender_gn_disconnect`, `blender_gn_set_input`, `blender_gn_set_modifier_input`,
     `blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
     `blender_gn_validate`
+  - generic nodes: `blender_node_create_tree`, `blender_node_get_tree`,
+    `blender_node_add/remove/connect/disconnect/set_input/set_property` for
+    GEOMETRY / MATERIAL / WORLD / COMPOSITOR
+  - undo/transactions: `blender_checkpoint`, `blender_undo`,
+    `blender_redo`, `blender_transaction_*`
+  - visual feedback: `blender_viewport_screenshot` returns metadata plus an
+    MCP image content block when the PNG is locally accessible
   - materials/render: `blender_set_material`, `blender_render_image`
   - code fallback: `blender_execute_code`
 - **PolyHaven tools** call `api.polyhaven.com` directly:
@@ -176,10 +183,26 @@ auditable, and easier for local models to recover from than a monolithic
 `blender_execute_code` remains available as an advanced fallback for Blender
 operations not yet represented by typed tools.
 
+## v4.2 transactions and visual loop
+
+The add-on maintains one logical MCP transaction at a time. Begin pushes an
+undo checkpoint; typed direct-data handlers mutate the current state; commit
+pushes the completed state; rollback captures the edited state and performs one
+undo back to the begin checkpoint. Commands that internally depend on
+operator-heavy or arbitrary execution are blocked during a transaction so this
+boundary remains predictable.
+
+Viewport screenshots are captured from the largest visible `VIEW_3D` window
+region using Blender's window screenshot API and written as PNG. The MCP layer
+wraps that path in FastMCP `Image`, producing native MCP `ImageContent` for
+vision-capable clients.
+
 ## State management
 - `_llm_state` (server) — single source of truth for the active provider
   config; mutated by `blender_set_llm_provider` and startup args.
 - Add-on server state (`_server_running`, socket, thread) — Blender side only.
+- `_transaction_state` — one active typed-edit transaction, stored on the
+  Blender add-on side because rollback operates on Blender's undo state.
 
 ## Security model
 - The add-on binds `localhost` by default; Blender side has no auth token in

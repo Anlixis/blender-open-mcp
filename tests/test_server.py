@@ -148,6 +148,12 @@ class TestToolAnnotations:
         assert t.annotations.destructive_hint is True
 
     @pytest.mark.asyncio
+    async def test_viewport_screenshot_has_filesystem_side_effect(self):
+        t = await self._tool("blender_viewport_screenshot")
+        assert t.annotations.read_only_hint is False
+        assert t.annotations.destructive_hint is False
+
+    @pytest.mark.asyncio
     async def test_ai_prompt_is_not_readonly(self):
         t = await self._tool("blender_ai_prompt")
         assert t.annotations.read_only_hint is False
@@ -174,6 +180,19 @@ class TestToolAnnotations:
             "blender_gn_disconnect",
             "blender_gn_set_modifier_input",
             "blender_gn_validate",
+            "blender_node_create_tree",
+            "blender_node_get_tree",
+            "blender_node_add",
+            "blender_node_connect",
+            "blender_node_disconnect",
+            "blender_checkpoint",
+            "blender_undo",
+            "blender_redo",
+            "blender_transaction_begin",
+            "blender_transaction_status",
+            "blender_transaction_commit",
+            "blender_transaction_rollback",
+            "blender_viewport_screenshot",
             "blender_create_object",
             "blender_delete_object",
             "blender_ai_prompt",
@@ -196,6 +215,40 @@ class TestToolAnnotations:
 # ---------------------------------------------------------------------------
 # Tool behavior without Blender (validation before socket dispatch)
 # ---------------------------------------------------------------------------
+
+class TestV42ToolBehavior:
+    @pytest.mark.asyncio
+    async def test_viewport_screenshot_returns_image_content_helper(self, tmp_path):
+        import blender_open_mcp.server as srv
+        from fastmcp.utilities.types import Image
+
+        path = tmp_path / "viewport.png"
+        path.write_bytes(b"fake-png-for-wrapper-test")
+        response = {
+            "status": "ok",
+            "result": {
+                "file_path": str(path),
+                "width": 800,
+                "height": 600,
+            },
+        }
+        with patch.object(srv, "_send_blender_command", return_value=response):
+            result = await srv.blender_viewport_screenshot()
+
+        assert isinstance(result, list)
+        assert "viewport.png" in result[0]
+        assert isinstance(result[1], Image)
+
+    @pytest.mark.asyncio
+    async def test_generic_node_schema_is_flat(self):
+        from blender_open_mcp.server import mcp
+
+        tool = await mcp.get_tool("blender_node_add")
+        props = tool.parameters.get("properties", {})
+        assert "tree_type" in props
+        assert "node_type" in props
+        assert "params" not in props
+
 
 class TestToolInputValidation:
     @pytest.mark.asyncio

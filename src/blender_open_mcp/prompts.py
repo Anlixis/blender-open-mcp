@@ -106,6 +106,39 @@ def blender_build_geometry_nodes(object_name: str, description: str) -> str:
 
 
 @prompt(
+    name="blender_safe_node_edit",
+    title="Safely edit a Blender node tree",
+    description=(
+        "Guide an agent through a rollback-capable node edit with visual "
+        "verification using the generic node API."
+    ),
+)
+def blender_safe_node_edit(
+    tree_type: str,
+    target: str,
+    description: str,
+) -> str:
+    """Safe generic node-edit workflow with transaction and screenshot."""
+    return (
+        "You are editing a Blender node tree through blender_open_mcp.\n\n"
+        f"Tree type: {tree_type}\n"
+        f"Target: {target}\n"
+        f"Requested change: {description}\n\n"
+        "Workflow:\n"
+        "1. Inspect the existing graph with blender_node_get_tree.\n"
+        "2. Begin blender_transaction_begin before making typed data edits.\n"
+        "3. Use blender_node_add/remove/connect/disconnect/set_input/"
+        "set_property. Do not call blender_execute_code inside the transaction.\n"
+        "4. Inspect the tree again and verify node/link structure.\n"
+        "5. Commit with blender_transaction_commit only if the structure matches "
+        "the request. Otherwise use blender_transaction_rollback.\n"
+        "6. After the transaction is closed, call blender_viewport_screenshot "
+        "when the node changes have a visible scene result and inspect the image.\n"
+        "7. Prefer typed tools over arbitrary Python.\n"
+    )
+
+
+@prompt(
     name="blender_configure_llm",
     title="Configure the LLM backend provider",
     description=(
@@ -142,6 +175,7 @@ def register_prompts(mcp_server: FastMCP) -> None:
     mcp_server.add_prompt(blender_build_scene)
     mcp_server.add_prompt(blender_review_scene)
     mcp_server.add_prompt(blender_build_geometry_nodes)
+    mcp_server.add_prompt(blender_safe_node_edit)
     mcp_server.add_prompt(blender_configure_llm)
 
 
