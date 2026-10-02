@@ -96,6 +96,7 @@ class TestMCPEndToEnd:
                 "blender_build_scene",
                 "blender_review_scene",
                 "blender_build_geometry_nodes",
+                "blender_edit_node_tree",
                 "blender_configure_llm",
             ]:
                 assert expected in prompt_names
@@ -122,6 +123,23 @@ class TestMCPEndToEnd:
                 if hasattr(m.content, "text")
             )
             assert "blender_get_scene_info" in review_text
+
+            generic = await client.get_prompt(
+                "blender_edit_node_tree",
+                arguments={
+                    "tree_type": "MATERIAL",
+                    "tree_name": "TestMat",
+                    "description": "add a noise texture",
+                },
+            )
+            generic_text = "\n".join(
+                m.content.text
+                for m in generic.messages
+                if hasattr(m.content, "text")
+            )
+            assert "blender_transaction_begin" in generic_text
+            assert "blender_node_get_tree" in generic_text
+            assert "blender_viewport_screenshot" in generic_text
 
             cfg = await client.get_prompt(
                 "blender_configure_llm",
