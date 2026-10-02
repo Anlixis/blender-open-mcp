@@ -16,7 +16,7 @@ Protocol (JSON over TCP, newline-terminated):
 bl_info = {
     "name": "Blender MCP",
     "author": "blender-open-mcp contributors",
-    "version": (4, 1, 0),
+    "version": (4, 2, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar > Blender MCP",
     "description": "MCP server add-on: control Blender via the Model Context Protocol",
@@ -35,6 +35,7 @@ import traceback
 import urllib.request
 from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
+from uuid import uuid4
 
 
 # ---------------------------------------------------------------------------
@@ -77,6 +78,11 @@ _server_running = False
 _main_thread_jobs: "queue.Queue[_MainThreadJob]" = queue.Queue()
 _pump_registered = False
 _pump_verified = False  # set True by the pump's first real tick
+
+# Logical MCP transaction state. Transactions are intentionally limited to
+# direct typed data edits; operator-heavy commands are blocked while active so
+# one rollback can reliably return to the begin checkpoint.
+_transaction_state: Optional[Dict[str, Any]] = None
 
 
 # ---------------------------------------------------------------------------
