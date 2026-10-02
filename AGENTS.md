@@ -48,6 +48,15 @@ startup (CLI/env) and switched at runtime through MCP tools.
   `blender_list_llm_models` lists models. Ollama-only aliases
   (`blender_set_ollama_model`, `blender_set_ollama_url`,
   `blender_get_ollama_models`) are thin wrappers for backward compatibility.
+- **Transactional edits.** Multi-step destructive workflows should use
+  `blender_transaction_begin` / commit / rollback. The add-on inserts explicit
+  undo boundaries before typed mutations and uses a hidden Scene marker to find
+  transaction checkpoints.
+- **Generic node editing.** `blender_node_*` is the preferred abstraction for
+  Geometry, Material, World, and Compositor node trees. Keep `blender_gn_*`
+  backward-compatible for Geometry-specific workflows and modifier inputs.
+- **Visual verification.** Use `blender_viewport_screenshot` when an agent
+  needs a rendered/solid/material-preview snapshot of the live viewport.
 - **Tool-first procedural editing.** Prefer `blender_gn_*` and modifier tools
   over `blender_execute_code`. Geometry Nodes changes should be incremental:
   inspect → edit → validate → inspect. Arbitrary Python remains an advanced
