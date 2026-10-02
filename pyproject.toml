@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "blender-open-mcp"
-version = "4.1.0"
+version = "4.2.0"
 description = "Local-first MCP server for Blender with provider-agnostic AI backends (OpenAI-compatible, Ollama, LM Studio, llama.cpp) and agent-driven scene control"
 readme = "README.md"
 license = { file = "LICENSE" }
