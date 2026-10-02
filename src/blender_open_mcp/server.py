@@ -539,6 +539,37 @@ async def blender_add_modifier(
 
 
 @mcp.tool(
+    name="blender_set_modifier_properties",
+    annotations={
+        "title": "Set Modifier Properties",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_set_modifier_properties(
+    object_name: str,
+    modifier_name: str,
+    properties: Dict[str, Any],
+) -> str:
+    """Update public RNA properties on an existing modifier."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "set_modifier_properties",
+                {
+                    "object_name": object_name,
+                    "modifier_name": modifier_name,
+                    "properties": properties,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
     name="blender_remove_modifier",
     annotations={
         "title": "Remove Object Modifier",
@@ -684,7 +715,7 @@ async def blender_gn_remove_node(node_group: str, node_name: str) -> str:
         "title": "Connect Geometry Nodes",
         "readOnlyHint": False,
         "destructiveHint": False,
-        "idempotentHint": True,
+        "idempotentHint": False,
         "openWorldHint": False,
     },
 )
@@ -739,6 +770,39 @@ async def blender_gn_set_input(
                 {
                     "node_group": node_group,
                     "node_name": node_name,
+                    "input_socket": input_socket,
+                    "value": value,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_set_modifier_input",
+    annotations={
+        "title": "Set Geometry Nodes Modifier Input",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_set_modifier_input(
+    object_name: str,
+    modifier_name: str,
+    input_socket: str,
+    value: Any,
+) -> str:
+    """Set an exposed Geometry Nodes group input on an object's NODES modifier."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_set_modifier_input",
+                {
+                    "object_name": object_name,
+                    "modifier_name": modifier_name,
                     "input_socket": input_socket,
                     "value": value,
                 },
