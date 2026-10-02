@@ -154,3 +154,32 @@ def test_viewport_screenshot_rejects_invalid_shading_before_context_lookup():
         assert "shading must be one of" in str(exc)
     else:
         raise AssertionError("Expected invalid shading to be rejected")
+
+
+
+def test_transaction_rollback_walks_to_marker():
+    scene = FakeScene()
+    addon.bpy.context.scene = scene
+    tx_id = "mcp-tx-test"
+    addon._active_transaction_id = tx_id
+    scene[addon._TRANSACTION_PROP] = f"{tx_id}:active"
+
+    calls = {"count": 0}
+
+    def undo_once():
+        calls["count"] += 1
+        if calls["count"] == 2:
+            scene[addon._TRANSACTION_PROP] = tx_id
+        return {"FINISHED"}
+
+    addon.bpy.ops.ed.undo = MagicMock(side_effect=undo_once)
+    addon.bpy.ops.ed.undo.poll = MagicMock(return_value=True)
+
+    result = addon.handle_transaction_rollback(
+        {"transaction_id": tx_id, "max_undo_steps": 10}
+    )
+
+    assert result["status"] == "rolled_back"
+    assert result["undo_steps"] == 2
+    assert addon._active_transaction_id is None
+    assert addon._TRANSACTION_PROP not in scene
