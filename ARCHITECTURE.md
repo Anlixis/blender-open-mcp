@@ -83,11 +83,14 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
     `blender_delete_object`
   - modifiers: `blender_get_modifiers`, `blender_add_modifier`,
     `blender_set_modifier_properties`, `blender_remove_modifier`
-  - Geometry Nodes: `blender_gn_create_group`, `blender_gn_get_tree`,
-    `blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
-    `blender_gn_disconnect`, `blender_gn_set_input`, `blender_gn_set_modifier_input`,
-    `blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
-    `blender_gn_validate`
+  - Geometry Nodes compatibility API: `blender_gn_*`
+  - generic nodes: `blender_node_ensure_tree`, `blender_node_get_tree`,
+    `blender_node_add/remove`, `blender_node_connect/disconnect`,
+    `blender_node_set_input`, `blender_node_set_property`; targets are
+    Geometry, Material, World, and Compositor
+  - transactions: `blender_undo`, `blender_redo`,
+    `blender_transaction_begin/commit/rollback`
+  - viewport: `blender_viewport_screenshot`
   - materials/render: `blender_set_material`, `blender_render_image`
   - code fallback: `blender_execute_code`
 - **PolyHaven tools** call `api.polyhaven.com` directly:
@@ -176,10 +179,39 @@ auditable, and easier for local models to recover from than a monolithic
 `blender_execute_code` remains available as an advanced fallback for Blender
 operations not yet represented by typed tools.
 
+## Undo and transactions
+
+Typed mutating bridge commands get an explicit `bpy.ops.ed.undo_push` boundary.
+A transaction begins by storing a unique hidden marker on the current Scene and
+pushing that state to Blender's undo stack. The live marker is then changed
+without another push. Rollback repeatedly invokes Blender undo until the exact
+checkpoint marker reappears, then clears it. This allows a multi-tool agent
+workflow to roll back to its MCP boundary instead of guessing how many internal
+Blender undo entries each operation created. Only one MCP transaction is active
+at a time.
+
+## Generic node API
+
+`blender_node_*` resolves a target into one of four node-tree families:
+Geometry node groups, Material shader trees, World shader trees, or a Scene
+Compositor tree. The same add/remove/connect/disconnect/set-input/property
+operations are shared across them. Geometry-specific interface/modifier tools
+remain under `blender_gn_*` for backward compatibility and exposed modifier
+inputs.
+
+## Viewport capture
+
+`blender_viewport_screenshot` finds the first open `VIEW_3D` area, temporarily
+overrides its shading mode and render resolution, performs an OpenGL viewport
+render on Blender's main thread, writes a PNG, and restores all temporary
+settings. The MCP result returns the local file path and capture metadata.
+
 ## State management
 - `_llm_state` (server) — single source of truth for the active provider
   config; mutated by `blender_set_llm_provider` and startup args.
 - Add-on server state (`_server_running`, socket, thread) — Blender side only.
+- `_active_transaction_id` + a hidden Scene marker — Blender-side MCP
+  transaction boundary state.
 
 ## Security model
 - The add-on binds `localhost` by default; Blender side has no auth token in
