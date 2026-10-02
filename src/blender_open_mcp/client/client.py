@@ -136,7 +136,7 @@ class BlenderMCPClient:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "clientInfo": {"name": "blender-open-mcp-client", "version": "4.0.0"},
+                "clientInfo": {"name": "blender-open-mcp-client", "version": "4.1.0"},
             },
         }
         try:
@@ -288,6 +288,22 @@ class BlenderMCPClient:
             args["node_group"] = node_group
         return await self.call_tool("blender_add_modifier", args)
 
+    async def set_modifier_properties(
+        self,
+        object_name: str,
+        modifier_name: str,
+        properties: Dict[str, Any],
+    ) -> str:
+        """Update public RNA properties on an existing modifier."""
+        return await self.call_tool(
+            "blender_set_modifier_properties",
+            {
+                "object_name": object_name,
+                "modifier_name": modifier_name,
+                "properties": properties,
+            },
+        )
+
     async def gn_create_group(
         self,
         name: str,
@@ -368,6 +384,24 @@ class BlenderMCPClient:
             {
                 "node_group": node_group,
                 "node_name": node_name,
+                "input_socket": input_socket,
+                "value": value,
+            },
+        )
+
+    async def gn_set_modifier_input(
+        self,
+        object_name: str,
+        modifier_name: str,
+        input_socket: str,
+        value: Any,
+    ) -> str:
+        """Set an exposed Geometry Nodes modifier input."""
+        return await self.call_tool(
+            "blender_gn_set_modifier_input",
+            {
+                "object_name": object_name,
+                "modifier_name": modifier_name,
                 "input_socket": input_socket,
                 "value": value,
             },
