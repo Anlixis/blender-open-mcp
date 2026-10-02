@@ -1775,6 +1775,22 @@ HANDLERS = {
     "gn_set_node_property":     handle_gn_set_node_property,
     "gn_add_interface_socket":  handle_gn_add_interface_socket,
     "gn_validate":              handle_gn_validate,
+    "node_create_tree":         handle_node_create_tree,
+    "node_get_tree":            handle_node_get_tree,
+    "node_add":                 handle_node_add,
+    "node_remove":              handle_node_remove,
+    "node_connect":             handle_node_connect,
+    "node_disconnect":          handle_node_disconnect,
+    "node_set_input":           handle_node_set_input,
+    "node_set_property":        handle_node_set_property,
+    "checkpoint":               handle_checkpoint,
+    "undo":                     handle_undo,
+    "redo":                     handle_redo,
+    "transaction_begin":        handle_transaction_begin,
+    "transaction_status":       handle_transaction_status,
+    "transaction_commit":       handle_transaction_commit,
+    "transaction_rollback":     handle_transaction_rollback,
+    "viewport_screenshot":      handle_viewport_screenshot,
     "create_object":            handle_create_object,
     "modify_object":            handle_modify_object,
     "delete_object":            handle_delete_object,
@@ -1813,11 +1829,28 @@ def _dispatch(command_type: str, params: Dict) -> bytes:
             f"Unknown command '{command_type}'. Available: {list(HANDLERS)}"
         )
     try:
+        if (
+            _transaction_state is not None
+            and command_type in _TRANSACTION_UNSAFE_COMMANDS
+        ):
+            raise RuntimeError(
+                f"Command '{command_type}' is blocked while transaction "
+                f"'{_transaction_state['label']}' is active. Commit or rollback "
+                "the transaction first."
+            )
+
         if command_type in WORKER_THREAD_COMMANDS:
             result = handler(params)
         else:
             # bpy is not thread safe: run the handler on Blender's main thread.
             result = _run_on_main_thread(lambda: handler(params))
+
+        if (
+            _transaction_state is not None
+            and command_type in _TRANSACTION_MUTATION_COMMANDS
+        ):
+            _transaction_state["mutation_count"] += 1
+
         return _ok(result)
     except Exception as exc:
         tb = traceback.format_exc()
