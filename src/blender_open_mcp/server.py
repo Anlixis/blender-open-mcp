@@ -747,6 +747,41 @@ async def blender_gn_connect(
 
 
 @mcp.tool(
+    name="blender_gn_disconnect",
+    annotations={
+        "title": "Disconnect Geometry Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_disconnect(
+    node_group: str,
+    to_node: str,
+    to_socket: Union[str, int],
+    from_node: Optional[str] = None,
+    from_socket: Optional[Union[str, int]] = None,
+) -> str:
+    """Remove links targeting a socket, optionally filtered by source."""
+    params: Dict[str, Any] = {
+        "node_group": node_group,
+        "to_node": to_node,
+        "to_socket": to_socket,
+    }
+    if from_node:
+        params["from_node"] = from_node
+    if from_socket is not None:
+        params["from_socket"] = from_socket
+    try:
+        return _format_blender_result(
+            _send_blender_command("gn_disconnect", params)
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
     name="blender_gn_set_input",
     annotations={
         "title": "Set Geometry Node Input",
