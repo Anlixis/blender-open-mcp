@@ -257,6 +257,128 @@ class BlenderMCPClient:
         """Delete an object from the Blender scene."""
         return await self.call_tool("blender_delete_object", {"name": name})
 
+    async def get_selection(self) -> str:
+        """Get active object, selected objects, and Blender mode."""
+        return await self.call_tool("blender_get_selection")
+
+    async def get_modifiers(self, object_name: str) -> str:
+        """List modifiers on a Blender object."""
+        return await self.call_tool(
+            "blender_get_modifiers", {"object_name": object_name}
+        )
+
+    async def add_modifier(
+        self,
+        object_name: str,
+        modifier_type: str,
+        name: Optional[str] = None,
+        properties: Optional[Dict[str, Any]] = None,
+        node_group: Optional[str] = None,
+    ) -> str:
+        """Add a modifier with optional properties."""
+        args: Dict[str, Any] = {
+            "object_name": object_name,
+            "modifier_type": modifier_type,
+        }
+        if name:
+            args["name"] = name
+        if properties:
+            args["properties"] = properties
+        if node_group:
+            args["node_group"] = node_group
+        return await self.call_tool("blender_add_modifier", args)
+
+    async def gn_create_group(
+        self,
+        name: str,
+        object_name: Optional[str] = None,
+        modifier_name: Optional[str] = None,
+    ) -> str:
+        """Create/reuse a Geometry Nodes group and optionally attach it."""
+        args: Dict[str, Any] = {"name": name}
+        if object_name:
+            args["object_name"] = object_name
+        if modifier_name:
+            args["modifier_name"] = modifier_name
+        return await self.call_tool("blender_gn_create_group", args)
+
+    async def gn_get_tree(self, node_group: str, include_sockets: bool = True) -> str:
+        """Inspect a Geometry Nodes graph."""
+        return await self.call_tool(
+            "blender_gn_get_tree",
+            {"node_group": node_group, "include_sockets": include_sockets},
+        )
+
+    async def gn_add_node(
+        self,
+        node_group: str,
+        node_type: str,
+        name: Optional[str] = None,
+        label: Optional[str] = None,
+        location: Optional[List[float]] = None,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Add a node to a Geometry Nodes group."""
+        args: Dict[str, Any] = {
+            "node_group": node_group,
+            "node_type": node_type,
+        }
+        if name:
+            args["name"] = name
+        if label is not None:
+            args["label"] = label
+        if location is not None:
+            args["location"] = location
+        if properties:
+            args["properties"] = properties
+        return await self.call_tool("blender_gn_add_node", args)
+
+    async def gn_connect(
+        self,
+        node_group: str,
+        from_node: str,
+        from_socket: Any,
+        to_node: str,
+        to_socket: Any,
+        replace: bool = True,
+    ) -> str:
+        """Connect two Geometry Nodes sockets."""
+        return await self.call_tool(
+            "blender_gn_connect",
+            {
+                "node_group": node_group,
+                "from_node": from_node,
+                "from_socket": from_socket,
+                "to_node": to_node,
+                "to_socket": to_socket,
+                "replace": replace,
+            },
+        )
+
+    async def gn_set_input(
+        self,
+        node_group: str,
+        node_name: str,
+        input_socket: Any,
+        value: Any,
+    ) -> str:
+        """Set a Geometry Nodes input default value."""
+        return await self.call_tool(
+            "blender_gn_set_input",
+            {
+                "node_group": node_group,
+                "node_name": node_name,
+                "input_socket": input_socket,
+                "value": value,
+            },
+        )
+
+    async def gn_validate(self, node_group: str) -> str:
+        """Validate a Geometry Nodes graph."""
+        return await self.call_tool(
+            "blender_gn_validate", {"node_group": node_group}
+        )
+
     async def set_material(
         self,
         object_name: str,
