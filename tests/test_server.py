@@ -171,6 +171,7 @@ class TestToolAnnotations:
             "blender_gn_get_tree",
             "blender_gn_add_node",
             "blender_gn_connect",
+            "blender_gn_disconnect",
             "blender_gn_set_modifier_input",
             "blender_gn_validate",
             "blender_create_object",
