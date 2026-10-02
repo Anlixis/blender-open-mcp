@@ -139,6 +139,7 @@ class TestAddonHandlers(unittest.TestCase):
             "gn_add_node",
             "gn_remove_node",
             "gn_connect",
+            "gn_disconnect",
             "gn_set_input",
             "gn_set_modifier_input",
             "gn_set_node_property",
