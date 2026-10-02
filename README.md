@@ -124,11 +124,24 @@ Example Claude/Cursor-style config:
 **Modifiers:** `blender_get_modifiers`, `blender_add_modifier`,
 `blender_set_modifier_properties`, `blender_remove_modifier`.
 
-**Geometry Nodes:** `blender_gn_create_group`, `blender_gn_get_tree`,
-`blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
-`blender_gn_disconnect`, `blender_gn_set_input`, `blender_gn_set_modifier_input`,
-`blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
-`blender_gn_validate`.
+**Geometry Nodes (legacy-compatible typed API):** `blender_gn_create_group`,
+`blender_gn_get_tree`, `blender_gn_add_node`, `blender_gn_remove_node`,
+`blender_gn_connect`, `blender_gn_disconnect`, `blender_gn_set_input`,
+`blender_gn_set_modifier_input`, `blender_gn_set_node_property`,
+`blender_gn_add_interface_socket`, `blender_gn_validate`.
+
+**Generic node API (v4.2):** `blender_node_ensure_tree`,
+`blender_node_get_tree`, `blender_node_add`, `blender_node_remove`,
+`blender_node_connect`, `blender_node_disconnect`,
+`blender_node_set_input`, `blender_node_set_property`.
+Supported targets: `GEOMETRY`, `MATERIAL`, `WORLD`, `COMPOSITOR`.
+
+**Undo / transactions:** `blender_undo`, `blender_redo`,
+`blender_transaction_begin`, `blender_transaction_commit`,
+`blender_transaction_rollback`.
+
+**Visual verification:** `blender_viewport_screenshot` captures an open
+`VIEW_3D` area as PNG in Wireframe, Solid, Material Preview, or Rendered mode.
 
 The Geometry Nodes tools are intentionally typed and incremental: agents can
 inspect a graph, make a small edit, validate it, and inspect again instead of
@@ -153,6 +166,7 @@ sending a large arbitrary Python script through `blender_execute_code`.
 - `blender_build_scene` – guided plan for building a scene from a description.
 - `blender_review_scene` – read-only inspection workflow.
 - `blender_build_geometry_nodes` – tool-first Geometry Nodes editing workflow.
+- `blender_edit_node_tree` – transactional generic node-tree workflow.
 - `blender_configure_llm` – provider-switching instructions with examples.
 
 Prompts are registered in `src/blender_open_mcp/prompts.py`.
@@ -180,6 +194,29 @@ On Blender 5.2, exposed Geometry Nodes modifier inputs use the new RNA API
 path automatically and falls back to legacy ID-properties for Blender 5.1 and
 earlier.
 
+
+### v4.2 transactional workflow
+
+For multi-step edits:
+
+1. `blender_transaction_begin` and keep the returned `transaction_id`.
+2. Perform typed Blender/node operations.
+3. Inspect the result and optionally capture `blender_viewport_screenshot`.
+4. Call `blender_transaction_commit` if correct, otherwise
+   `blender_transaction_rollback`.
+
+The add-on inserts explicit undo boundaries before typed mutations. Rollback
+uses a hidden Scene marker and walks Blender's undo stack back to the exact MCP
+transaction boundary. Only one MCP transaction may be active at a time.
+
+### Generic node-tree workflow
+
+The same node tools now work across procedural and shading/compositing systems.
+For non-Geometry targets, `tree_name` identifies the owner:
+- `MATERIAL`: material name
+- `WORLD`: world name (empty selects the current scene World)
+- `COMPOSITOR`: scene name (empty selects the current scene)
+- `GEOMETRY`: GeometryNodeTree name
 
 ### Runtime provider switching (examples)
 
