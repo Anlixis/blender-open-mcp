@@ -105,6 +105,38 @@ def blender_build_geometry_nodes(object_name: str, description: str) -> str:
     )
 
 
+
+@prompt(
+    name="blender_edit_node_tree",
+    title="Edit Blender node trees safely",
+    description=(
+        "Render a tool-first workflow for Geometry, Material, World, or "
+        "Compositor node-tree editing with transaction and visual verification."
+    ),
+)
+def blender_edit_node_tree(tree_type: str, tree_name: str, description: str) -> str:
+    """Instructions for generic Blender node-tree editing."""
+    return (
+        "You are editing Blender nodes through blender_open_mcp.\n\n"
+        f"Tree type: {tree_type}\n"
+        f"Tree/owner name: {tree_name}\n"
+        f"Requested change: {description}\n\n"
+        "Workflow:\n"
+        "1. Inspect the scene/selection when object context matters.\n"
+        "2. Call blender_node_ensure_tree only if the requested node tree is not "
+        "already enabled, then inspect with blender_node_get_tree.\n"
+        "3. Begin blender_transaction_begin before multi-step edits. Keep the "
+        "returned transaction_id.\n"
+        "4. Prefer blender_node_add/remove/connect/disconnect/set_input/"
+        "set_property over blender_execute_code.\n"
+        "5. Re-inspect the node tree after significant edits.\n"
+        "6. When visual output matters, call blender_viewport_screenshot.\n"
+        "7. If an edit fails or the result is wrong, call "
+        "blender_transaction_rollback with the transaction_id. Otherwise call "
+        "blender_transaction_commit.\n"
+    )
+
+
 @prompt(
     name="blender_configure_llm",
     title="Configure the LLM backend provider",
@@ -142,6 +174,7 @@ def register_prompts(mcp_server: FastMCP) -> None:
     mcp_server.add_prompt(blender_build_scene)
     mcp_server.add_prompt(blender_review_scene)
     mcp_server.add_prompt(blender_build_geometry_nodes)
+    mcp_server.add_prompt(blender_edit_node_tree)
     mcp_server.add_prompt(blender_configure_llm)
 
 
