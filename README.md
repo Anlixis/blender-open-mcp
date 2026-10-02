@@ -175,6 +175,11 @@ Sockets may be addressed by name, identifier, or zero-based index. Node types
 use Blender `bl_idname` values such as `GeometryNodeJoinGeometry` and
 `GeometryNodeInstanceOnPoints`.
 
+On Blender 5.2, exposed Geometry Nodes modifier inputs use the new RNA API
+(`modifier.properties.inputs.<identifier>.value`). The add-on detects this
+path automatically and falls back to legacy ID-properties for Blender 5.1 and
+earlier.
+
 
 ### Runtime provider switching (examples)
 
