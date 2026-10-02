@@ -91,9 +91,11 @@ mcp = FastMCP(
     instructions=(
         "Control a live Blender session through the Model Context Protocol and "
         "route natural-language prompts to any LLM backend (OpenAI-compatible, "
-        "Ollama, LM Studio, llama.cpp, Azure). Prefer typed scene, modifier, and "
-        "Geometry Nodes tools over blender_execute_code. Use blender_get_scene_info "
-        "and blender_get_selection to inspect context before editing."
+        "Ollama, LM Studio, llama.cpp, Azure). Prefer typed scene, modifier, "
+        "generic node, and Geometry Nodes tools over blender_execute_code. Use "
+        "blender_get_scene_info and blender_get_selection before editing, wrap "
+        "multi-step destructive work in blender_transaction_begin/commit, and "
+        "use blender_viewport_screenshot for visual verification when useful."
     ),
 )
 
@@ -928,6 +930,433 @@ async def blender_gn_validate(node_group: str) -> str:
     try:
         return _format_blender_result(
             _send_blender_command("gn_validate", {"node_group": node_group})
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+
+# ===========================================================================
+# MCP Tools — Generic Nodes (Geometry / Material / World / Compositor)
+# ===========================================================================
+
+@mcp.tool(
+    name="blender_node_ensure_tree",
+    annotations={
+        "title": "Ensure Node Tree",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_ensure_tree(tree_type: str, tree_name: str = "") -> str:
+    """Create/enable a node tree target. tree_type: GEOMETRY, MATERIAL, WORLD, COMPOSITOR."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "node_ensure_tree",
+                {"tree_type": tree_type, "tree_name": tree_name},
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_get_tree",
+    annotations={
+        "title": "Inspect Node Tree",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_get_tree(
+    tree_type: str,
+    tree_name: str = "",
+    include_sockets: bool = True,
+) -> str:
+    """Inspect Geometry, Material, World, or Compositor nodes and links."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "node_get_tree",
+                {
+                    "tree_type": tree_type,
+                    "tree_name": tree_name,
+                    "include_sockets": include_sockets,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_add",
+    annotations={
+        "title": "Add Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_add(
+    tree_type: str,
+    tree_name: str,
+    node_type: str,
+    name: Optional[str] = None,
+    label: Optional[str] = None,
+    location: Optional[List[float]] = None,
+    properties: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Add any Blender node by bl_idname to a supported node tree."""
+    params: Dict[str, Any] = {
+        "tree_type": tree_type,
+        "tree_name": tree_name,
+        "node_type": node_type,
+    }
+    if name:
+        params["name"] = name
+    if label is not None:
+        params["label"] = label
+    if location is not None:
+        params["location"] = location
+    if properties:
+        params["properties"] = properties
+    try:
+        return _format_blender_result(_send_blender_command("node_add", params))
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_remove",
+    annotations={
+        "title": "Remove Node",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_remove(
+    tree_type: str,
+    tree_name: str,
+    node_name: str,
+) -> str:
+    """Remove a named node from a supported node tree."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "node_remove",
+                {
+                    "tree_type": tree_type,
+                    "tree_name": tree_name,
+                    "node_name": node_name,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_connect",
+    annotations={
+        "title": "Connect Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_connect(
+    tree_type: str,
+    tree_name: str,
+    from_node: str,
+    from_socket: Union[str, int],
+    to_node: str,
+    to_socket: Union[str, int],
+    replace: bool = True,
+) -> str:
+    """Connect node sockets by name, identifier, or zero-based index."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "node_connect",
+                {
+                    "tree_type": tree_type,
+                    "tree_name": tree_name,
+                    "from_node": from_node,
+                    "from_socket": from_socket,
+                    "to_node": to_node,
+                    "to_socket": to_socket,
+                    "replace": replace,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_disconnect",
+    annotations={
+        "title": "Disconnect Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_disconnect(
+    tree_type: str,
+    tree_name: str,
+    to_node: str,
+    to_socket: Union[str, int],
+    from_node: Optional[str] = None,
+    from_socket: Optional[Union[str, int]] = None,
+) -> str:
+    """Remove links targeting an input socket, optionally filtered by source."""
+    params: Dict[str, Any] = {
+        "tree_type": tree_type,
+        "tree_name": tree_name,
+        "to_node": to_node,
+        "to_socket": to_socket,
+    }
+    if from_node:
+        params["from_node"] = from_node
+    if from_socket is not None:
+        params["from_socket"] = from_socket
+    try:
+        return _format_blender_result(
+            _send_blender_command("node_disconnect", params)
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_set_input",
+    annotations={
+        "title": "Set Node Input",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_set_input(
+    tree_type: str,
+    tree_name: str,
+    node_name: str,
+    input_socket: Union[str, int],
+    value: Any,
+) -> str:
+    """Set an unlinked node input default value."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "node_set_input",
+                {
+                    "tree_type": tree_type,
+                    "tree_name": tree_name,
+                    "node_name": node_name,
+                    "input_socket": input_socket,
+                    "value": value,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_node_set_property",
+    annotations={
+        "title": "Set Node Property",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_node_set_property(
+    tree_type: str,
+    tree_name: str,
+    node_name: str,
+    property_name: str,
+    value: Any,
+) -> str:
+    """Set a public RNA property on a node in a supported node tree."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "node_set_property",
+                {
+                    "tree_type": tree_type,
+                    "tree_name": tree_name,
+                    "node_name": node_name,
+                    "property_name": property_name,
+                    "value": value,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+# ===========================================================================
+# MCP Tools — Undo / Transactions
+# ===========================================================================
+
+@mcp.tool(
+    name="blender_undo",
+    annotations={
+        "title": "Undo Blender Changes",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_undo(steps: int = 1) -> str:
+    """Undo one or more Blender undo-stack steps."""
+    try:
+        return _format_blender_result(
+            _send_blender_command("undo", {"steps": steps})
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_redo",
+    annotations={
+        "title": "Redo Blender Changes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_redo(steps: int = 1) -> str:
+    """Redo one or more Blender undo-stack steps."""
+    try:
+        return _format_blender_result(
+            _send_blender_command("redo", {"steps": steps})
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_transaction_begin",
+    annotations={
+        "title": "Begin Blender Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_transaction_begin(label: str = "MCP transaction") -> str:
+    """Begin one MCP transaction. Only one transaction may be active at a time."""
+    try:
+        return _format_blender_result(
+            _send_blender_command("transaction_begin", {"label": label})
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_transaction_commit",
+    annotations={
+        "title": "Commit Blender Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_transaction_commit(transaction_id: str) -> str:
+    """Commit the active MCP transaction."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "transaction_commit",
+                {"transaction_id": transaction_id},
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_transaction_rollback",
+    annotations={
+        "title": "Rollback Blender Transaction",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_transaction_rollback(
+    transaction_id: str,
+    max_undo_steps: int = 100,
+) -> str:
+    """Undo back to the exact MCP transaction checkpoint."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "transaction_rollback",
+                {
+                    "transaction_id": transaction_id,
+                    "max_undo_steps": max_undo_steps,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+# ===========================================================================
+# MCP Tools — Viewport
+# ===========================================================================
+
+@mcp.tool(
+    name="blender_viewport_screenshot",
+    annotations={
+        "title": "Capture Blender Viewport",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_viewport_screenshot(
+    file_path: Optional[str] = None,
+    width: int = 1024,
+    height: int = 768,
+    shading: str = "SOLID",
+) -> str:
+    """Capture the first open VIEW_3D area to a PNG file and return its path."""
+    params: Dict[str, Any] = {
+        "width": width,
+        "height": height,
+        "shading": shading,
+    }
+    if file_path:
+        params["file_path"] = file_path
+    try:
+        return _format_blender_result(
+            _send_blender_command("viewport_screenshot", params)
         )
     except Exception as exc:
         return _handle_blender_error(exc)
