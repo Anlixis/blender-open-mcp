@@ -16,7 +16,7 @@ Protocol (JSON over TCP, newline-terminated):
 bl_info = {
     "name": "Blender MCP",
     "author": "blender-open-mcp contributors",
-    "version": (4, 0, 0),
+    "version": (4, 1, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar > Blender MCP",
     "description": "MCP server add-on: control Blender via the Model Context Protocol",
@@ -371,6 +371,436 @@ def handle_delete_object(params: Dict) -> Any:
     return {"deleted": name}
 
 
+
+# ---------------------------------------------------------------------------
+# Selection, modifiers, and Geometry Nodes
+# ---------------------------------------------------------------------------
+
+def _json_safe_value(value: Any) -> Any:
+    """Convert common Blender/RNA values into JSON-safe data."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    if hasattr(value, "name") and isinstance(getattr(value, "name", None), str):
+        return {"name": value.name, "type": type(value).__name__}
+    try:
+        return [_json_safe_value(v) for v in value]
+    except (TypeError, AttributeError):
+        return str(value)
+
+
+def _set_rna_properties(target: Any, properties: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Set explicitly requested public RNA properties and report what changed."""
+    changed: Dict[str, Any] = {}
+    for key, value in (properties or {}).items():
+        if not key or key.startswith("_") or key in {"rna_type", "bl_rna"}:
+            raise ValueError(f"Property '{key}' is not writable through MCP.")
+        if not hasattr(target, key):
+            raise ValueError(
+                f"{type(target).__name__} has no property '{key}'."
+            )
+        try:
+            setattr(target, key, value)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not set property '{key}' to {value!r}: {exc}"
+            ) from exc
+        changed[key] = _json_safe_value(getattr(target, key))
+    return changed
+
+
+def _modifier_info(mod: Any) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "name": mod.name,
+        "type": mod.type,
+        "show_viewport": bool(getattr(mod, "show_viewport", True)),
+        "show_render": bool(getattr(mod, "show_render", True)),
+    }
+    node_group = getattr(mod, "node_group", None)
+    if node_group is not None:
+        info["node_group"] = node_group.name
+    return info
+
+
+def _geometry_node_group(name: str):
+    if not name:
+        raise ValueError("node_group is required.")
+    tree = bpy.data.node_groups.get(name)
+    if tree is None:
+        raise ValueError(f"Geometry node group '{name}' not found.")
+    if getattr(tree, "bl_idname", "") != "GeometryNodeTree":
+        raise ValueError(
+            f"Node group '{name}' is '{getattr(tree, 'bl_idname', 'unknown')}', "
+            "not GeometryNodeTree."
+        )
+    return tree
+
+
+def _resolve_socket(sockets: Any, selector: Any):
+    """Resolve a node socket by name, identifier, or zero-based index."""
+    if isinstance(selector, int):
+        try:
+            return sockets[selector]
+        except (IndexError, TypeError):
+            raise ValueError(f"Socket index {selector} is out of range.")
+
+    key = str(selector)
+    socket = sockets.get(key) if hasattr(sockets, "get") else None
+    if socket is not None:
+        return socket
+    for candidate in sockets:
+        if getattr(candidate, "identifier", None) == key:
+            return candidate
+    raise ValueError(f"Socket '{selector}' not found.")
+
+
+def _socket_info(socket: Any) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "name": socket.name,
+        "identifier": getattr(socket, "identifier", socket.name),
+        "type": getattr(socket, "bl_idname", type(socket).__name__),
+        "enabled": bool(getattr(socket, "enabled", True)),
+        "is_linked": bool(getattr(socket, "is_linked", False)),
+    }
+    if hasattr(socket, "default_value"):
+        try:
+            info["default_value"] = _json_safe_value(socket.default_value)
+        except Exception:
+            pass
+    return info
+
+
+def _node_info(node: Any, include_sockets: bool = True) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "name": node.name,
+        "label": getattr(node, "label", ""),
+        "type": getattr(node, "bl_idname", type(node).__name__),
+        "location": list(getattr(node, "location", (0.0, 0.0))),
+        "hide": bool(getattr(node, "hide", False)),
+    }
+    if include_sockets:
+        info["inputs"] = [_socket_info(s) for s in node.inputs]
+        info["outputs"] = [_socket_info(s) for s in node.outputs]
+    return info
+
+
+def _coerce_socket_value(socket: Any, value: Any) -> Any:
+    """Resolve string names for ID sockets; pass scalar/vector values through."""
+    socket_type = getattr(socket, "bl_idname", "")
+    if isinstance(value, str):
+        collections = {
+            "NodeSocketObject": getattr(bpy.data, "objects", None),
+            "NodeSocketCollection": getattr(bpy.data, "collections", None),
+            "NodeSocketMaterial": getattr(bpy.data, "materials", None),
+            "NodeSocketImage": getattr(bpy.data, "images", None),
+            "NodeSocketTexture": getattr(bpy.data, "textures", None),
+        }
+        collection = collections.get(socket_type)
+        if collection is not None:
+            resolved = collection.get(value)
+            if resolved is None:
+                raise ValueError(
+                    f"Could not resolve '{value}' for socket type {socket_type}."
+                )
+            return resolved
+    return value
+
+
+def handle_get_selection(_params: Dict) -> Any:
+    selected = list(getattr(bpy.context, "selected_objects", []) or [])
+    active = getattr(getattr(bpy.context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None)
+    return {
+        "active": active_obj.name if active_obj else None,
+        "selected": [obj.name for obj in selected],
+        "mode": getattr(bpy.context, "mode", "OBJECT"),
+    }
+
+
+def handle_get_modifiers(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    return {
+        "object": object_name,
+        "modifiers": [_modifier_info(mod) for mod in obj.modifiers],
+    }
+
+
+def handle_add_modifier(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_type = str(params.get("modifier_type", "")).upper()
+    if not modifier_type:
+        raise ValueError("modifier_type is required.")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+
+    name = params.get("name") or modifier_type.title()
+    mod = obj.modifiers.new(name=name, type=modifier_type)
+    changed = _set_rna_properties(mod, params.get("properties"))
+
+    node_group_name = params.get("node_group")
+    if node_group_name:
+        if modifier_type != "NODES":
+            raise ValueError("node_group can only be set on a NODES modifier.")
+        mod.node_group = _geometry_node_group(node_group_name)
+
+    return {
+        "object": object_name,
+        "modifier": _modifier_info(mod),
+        "properties": changed,
+    }
+
+
+def handle_remove_modifier(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_name = params.get("modifier_name", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' not found on object '{object_name}'."
+        )
+    obj.modifiers.remove(mod)
+    return {"object": object_name, "removed_modifier": modifier_name}
+
+
+def _new_geometry_interface_socket(tree: Any, name: str, in_out: str, socket_type: str):
+    """Blender 4.x+ node interface API with a Blender 3.x fallback."""
+    direction = in_out.upper()
+    if direction not in {"INPUT", "OUTPUT"}:
+        raise ValueError("in_out must be INPUT or OUTPUT.")
+    if hasattr(tree, "interface") and hasattr(tree.interface, "new_socket"):
+        return tree.interface.new_socket(
+            name=name,
+            in_out=direction,
+            socket_type=socket_type,
+        )
+    collection = tree.inputs if direction == "INPUT" else tree.outputs
+    return collection.new(socket_type, name)
+
+
+def handle_gn_create_group(params: Dict) -> Any:
+    name = params.get("name", "")
+    if not name:
+        raise ValueError("name is required.")
+
+    tree = bpy.data.node_groups.get(name)
+    created = tree is None
+    if tree is None:
+        tree = bpy.data.node_groups.new(name=name, type="GeometryNodeTree")
+    elif getattr(tree, "bl_idname", "") != "GeometryNodeTree":
+        raise ValueError(f"Existing node group '{name}' is not GeometryNodeTree.")
+
+    if created and params.get("create_geometry_interface", True):
+        _new_geometry_interface_socket(tree, "Geometry", "INPUT", "NodeSocketGeometry")
+        _new_geometry_interface_socket(tree, "Geometry", "OUTPUT", "NodeSocketGeometry")
+        input_node = tree.nodes.new("NodeGroupInput")
+        output_node = tree.nodes.new("NodeGroupOutput")
+        input_node.location = (-200.0, 0.0)
+        output_node.location = (200.0, 0.0)
+        source = input_node.outputs.get("Geometry")
+        target = output_node.inputs.get("Geometry")
+        if source is not None and target is not None:
+            tree.links.new(source, target)
+
+    attached = None
+    object_name = params.get("object_name")
+    if object_name:
+        obj = bpy.data.objects.get(object_name)
+        if obj is None:
+            raise ValueError(f"Object '{object_name}' not found.")
+        modifier_name = params.get("modifier_name") or name
+        mod = obj.modifiers.get(modifier_name)
+        if mod is None:
+            mod = obj.modifiers.new(name=modifier_name, type="NODES")
+        if mod.type != "NODES":
+            raise ValueError(
+                f"Modifier '{modifier_name}' on '{object_name}' is not NODES."
+            )
+        mod.node_group = tree
+        attached = {"object": object_name, "modifier": modifier_name}
+
+    return {
+        "node_group": tree.name,
+        "created": created,
+        "attached": attached,
+        "node_count": len(tree.nodes),
+        "link_count": len(tree.links),
+    }
+
+
+def handle_gn_get_tree(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    include_sockets = bool(params.get("include_sockets", True))
+    nodes = [_node_info(node, include_sockets=include_sockets) for node in tree.nodes]
+    links = []
+    for link in tree.links:
+        links.append({
+            "from_node": link.from_node.name,
+            "from_socket": getattr(link.from_socket, "identifier", link.from_socket.name),
+            "to_node": link.to_node.name,
+            "to_socket": getattr(link.to_socket, "identifier", link.to_socket.name),
+            "is_valid": bool(getattr(link, "is_valid", True)),
+        })
+    return {
+        "node_group": tree.name,
+        "node_count": len(nodes),
+        "link_count": len(links),
+        "nodes": nodes,
+        "links": links,
+    }
+
+
+def handle_gn_add_node(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_type = params.get("node_type", "")
+    if not node_type:
+        raise ValueError("node_type is required.")
+    try:
+        node = tree.nodes.new(node_type)
+    except Exception as exc:
+        raise ValueError(f"Could not create node type '{node_type}': {exc}") from exc
+
+    if params.get("name"):
+        node.name = params["name"]
+    if params.get("label") is not None:
+        node.label = params["label"]
+    location = params.get("location")
+    if location is not None:
+        if not isinstance(location, (list, tuple)) or len(location) < 2:
+            raise ValueError("location must be [x, y].")
+        node.location = (float(location[0]), float(location[1]))
+    changed = _set_rna_properties(node, params.get("properties"))
+    return {
+        "node_group": tree.name,
+        "node": _node_info(node),
+        "properties": changed,
+    }
+
+
+def handle_gn_remove_node(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found in '{tree.name}'.")
+    tree.nodes.remove(node)
+    return {"node_group": tree.name, "removed_node": node_name}
+
+
+def handle_gn_connect(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    from_node_name = params.get("from_node", "")
+    to_node_name = params.get("to_node", "")
+    from_node = tree.nodes.get(from_node_name)
+    to_node = tree.nodes.get(to_node_name)
+    if from_node is None:
+        raise ValueError(f"Node '{from_node_name}' not found.")
+    if to_node is None:
+        raise ValueError(f"Node '{to_node_name}' not found.")
+
+    from_socket = _resolve_socket(from_node.outputs, params.get("from_socket"))
+    to_socket = _resolve_socket(to_node.inputs, params.get("to_socket"))
+
+    replace = bool(params.get("replace", True))
+    if replace and not getattr(to_socket, "is_multi_input", False):
+        for link in list(tree.links):
+            if link.to_socket == to_socket:
+                tree.links.remove(link)
+
+    link = tree.links.new(from_socket, to_socket)
+    return {
+        "node_group": tree.name,
+        "from": f"{from_node.name}.{from_socket.name}",
+        "to": f"{to_node.name}.{to_socket.name}",
+        "is_valid": bool(getattr(link, "is_valid", True)),
+    }
+
+
+def handle_gn_set_input(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found in '{tree.name}'.")
+    socket = _resolve_socket(node.inputs, params.get("input_socket"))
+    if not hasattr(socket, "default_value"):
+        raise ValueError(
+            f"Input '{socket.name}' on '{node_name}' has no default_value."
+        )
+    value = _coerce_socket_value(socket, params.get("value"))
+    try:
+        socket.default_value = value
+    except Exception as exc:
+        raise ValueError(
+            f"Could not set {node_name}.{socket.name} to {params.get('value')!r}: {exc}"
+        ) from exc
+    return {
+        "node_group": tree.name,
+        "node": node.name,
+        "input": socket.name,
+        "value": _json_safe_value(socket.default_value),
+    }
+
+
+def handle_gn_set_node_property(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found in '{tree.name}'.")
+    property_name = params.get("property_name", "")
+    if not property_name:
+        raise ValueError("property_name is required.")
+    changed = _set_rna_properties(node, {property_name: params.get("value")})
+    return {
+        "node_group": tree.name,
+        "node": node.name,
+        "changed": changed,
+    }
+
+
+def handle_gn_add_interface_socket(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    socket = _new_geometry_interface_socket(
+        tree,
+        params.get("name", ""),
+        params.get("in_out", "INPUT"),
+        params.get("socket_type", "NodeSocketFloat"),
+    )
+    return {
+        "node_group": tree.name,
+        "name": getattr(socket, "name", params.get("name", "")),
+        "in_out": params.get("in_out", "INPUT").upper(),
+        "socket_type": params.get("socket_type", "NodeSocketFloat"),
+    }
+
+
+def handle_gn_validate(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    invalid_links = []
+    for link in tree.links:
+        if not bool(getattr(link, "is_valid", True)):
+            invalid_links.append({
+                "from": f"{link.from_node.name}.{link.from_socket.name}",
+                "to": f"{link.to_node.name}.{link.to_socket.name}",
+            })
+    return {
+        "node_group": tree.name,
+        "valid": not invalid_links,
+        "node_count": len(tree.nodes),
+        "link_count": len(tree.links),
+        "invalid_links": invalid_links,
+    }
+
 def handle_set_material(params: Dict) -> Any:
     obj_name = params.get("object_name", "")
     mat_name = params.get("material_name", "")
@@ -606,6 +1036,19 @@ def handle_get_ollama_models(_params: Dict) -> Any:
 HANDLERS = {
     "get_scene_info":           handle_get_scene_info,
     "get_object_info":          handle_get_object_info,
+    "get_selection":            handle_get_selection,
+    "get_modifiers":            handle_get_modifiers,
+    "add_modifier":             handle_add_modifier,
+    "remove_modifier":          handle_remove_modifier,
+    "gn_create_group":          handle_gn_create_group,
+    "gn_get_tree":              handle_gn_get_tree,
+    "gn_add_node":              handle_gn_add_node,
+    "gn_remove_node":           handle_gn_remove_node,
+    "gn_connect":               handle_gn_connect,
+    "gn_set_input":             handle_gn_set_input,
+    "gn_set_node_property":     handle_gn_set_node_property,
+    "gn_add_interface_socket":  handle_gn_add_interface_socket,
+    "gn_validate":              handle_gn_validate,
     "create_object":            handle_create_object,
     "modify_object":            handle_modify_object,
     "delete_object":            handle_delete_object,
