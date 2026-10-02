@@ -136,7 +136,7 @@ class BlenderMCPClient:
             "params": {
                 "protocolVersion": "2024-11-05",
                 "capabilities": {"tools": {}},
-                "clientInfo": {"name": "blender-open-mcp-client", "version": "4.1.0"},
+                "clientInfo": {"name": "blender-open-mcp-client", "version": "4.2.0"},
             },
         }
         try:
@@ -432,6 +432,120 @@ class BlenderMCPClient:
         return await self.call_tool(
             "blender_gn_validate", {"node_group": node_group}
         )
+
+    async def node_ensure_tree(self, tree_type: str, tree_name: str = "") -> str:
+        """Create or enable a supported Blender node tree."""
+        return await self.call_tool(
+            "blender_node_ensure_tree",
+            {"tree_type": tree_type, "tree_name": tree_name},
+        )
+
+    async def node_get_tree(
+        self,
+        tree_type: str,
+        tree_name: str = "",
+        include_sockets: bool = True,
+    ) -> str:
+        """Inspect a supported Blender node tree."""
+        return await self.call_tool(
+            "blender_node_get_tree",
+            {
+                "tree_type": tree_type,
+                "tree_name": tree_name,
+                "include_sockets": include_sockets,
+            },
+        )
+
+    async def node_add(
+        self,
+        tree_type: str,
+        tree_name: str,
+        node_type: str,
+        name: Optional[str] = None,
+        label: Optional[str] = None,
+        location: Optional[List[float]] = None,
+        properties: Optional[Dict[str, Any]] = None,
+    ) -> str:
+        """Add a node to a Geometry/Material/World/Compositor tree."""
+        args: Dict[str, Any] = {
+            "tree_type": tree_type,
+            "tree_name": tree_name,
+            "node_type": node_type,
+        }
+        if name:
+            args["name"] = name
+        if label is not None:
+            args["label"] = label
+        if location is not None:
+            args["location"] = location
+        if properties:
+            args["properties"] = properties
+        return await self.call_tool("blender_node_add", args)
+
+    async def node_connect(
+        self,
+        tree_type: str,
+        tree_name: str,
+        from_node: str,
+        from_socket: Any,
+        to_node: str,
+        to_socket: Any,
+        replace: bool = True,
+    ) -> str:
+        """Connect sockets in a supported node tree."""
+        return await self.call_tool(
+            "blender_node_connect",
+            {
+                "tree_type": tree_type,
+                "tree_name": tree_name,
+                "from_node": from_node,
+                "from_socket": from_socket,
+                "to_node": to_node,
+                "to_socket": to_socket,
+                "replace": replace,
+            },
+        )
+
+    async def transaction_begin(self, label: str = "MCP transaction") -> str:
+        """Begin an MCP transaction."""
+        return await self.call_tool(
+            "blender_transaction_begin", {"label": label}
+        )
+
+    async def transaction_commit(self, transaction_id: str) -> str:
+        """Commit the active MCP transaction."""
+        return await self.call_tool(
+            "blender_transaction_commit", {"transaction_id": transaction_id}
+        )
+
+    async def transaction_rollback(
+        self, transaction_id: str, max_undo_steps: int = 100
+    ) -> str:
+        """Rollback the active MCP transaction."""
+        return await self.call_tool(
+            "blender_transaction_rollback",
+            {
+                "transaction_id": transaction_id,
+                "max_undo_steps": max_undo_steps,
+            },
+        )
+
+    async def viewport_screenshot(
+        self,
+        file_path: Optional[str] = None,
+        width: int = 1024,
+        height: int = 768,
+        shading: str = "SOLID",
+    ) -> str:
+        """Capture the first open Blender 3D viewport."""
+        args: Dict[str, Any] = {
+            "width": width,
+            "height": height,
+            "shading": shading,
+        }
+        if file_path:
+            args["file_path"] = file_path
+        return await self.call_tool("blender_viewport_screenshot", args)
 
     async def set_material(
         self,
