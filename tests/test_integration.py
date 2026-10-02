@@ -93,6 +93,7 @@ class TestMCPEndToEnd:
                 "blender_build_scene",
                 "blender_review_scene",
                 "blender_build_geometry_nodes",
+                "blender_safe_node_edit",
                 "blender_configure_llm",
             ]:
                 assert expected in prompt_names
