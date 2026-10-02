@@ -264,3 +264,58 @@ def test_gn_disconnect_removes_targeted_link():
 
     assert result["removed_count"] == 1
     assert links == []
+
+
+class FakeModifier52(dict):
+    def __init__(self, name, node_group, identifier, initial_value):
+        super().__init__()
+        self.name = name
+        self.type = "NODES"
+        self.node_group = node_group
+        runtime_input = SimpleNamespace(value=initial_value)
+        self.properties = SimpleNamespace(
+            inputs=SimpleNamespace(**{identifier: runtime_input})
+        )
+
+
+def test_gn_set_modifier_input_blender_52_rna_path():
+    interface_socket = SimpleNamespace(
+        item_type="SOCKET",
+        name="Offset",
+        identifier="Socket_2",
+        in_out="INPUT",
+        bl_socket_idname="NodeSocketVector",
+        default_value=[0.0, 0.0, 0.0],
+    )
+    tree = SimpleNamespace(
+        name="TestGN",
+        bl_idname="GeometryNodeTree",
+        interface=SimpleNamespace(items_tree=[interface_socket]),
+    )
+    modifier = FakeModifier52(
+        "GeometryNodes",
+        tree,
+        "Socket_2",
+        [0.0, 0.0, 0.0],
+    )
+    modifiers = MagicMock()
+    modifiers.get.return_value = modifier
+    obj = SimpleNamespace(name="Cube", modifiers=modifiers, update_tag=MagicMock())
+    objects = MagicMock()
+    objects.get.return_value = obj
+    addon.bpy.data.objects = objects
+
+    result = addon.handle_gn_set_modifier_input(
+        {
+            "object_name": "Cube",
+            "modifier_name": "GeometryNodes",
+            "input_socket": "Offset",
+            "value": [0.0, 0.0, 1.0],
+        }
+    )
+
+    assert modifier.properties.inputs.Socket_2.value == [0.0, 0.0, 1.0]
+    assert "Socket_2" not in modifier
+    assert result["storage"] == "rna"
+    assert result["value"] == [0.0, 0.0, 1.0]
+    obj.update_tag.assert_called_once()
