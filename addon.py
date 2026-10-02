@@ -16,7 +16,7 @@ Protocol (JSON over TCP, newline-terminated):
 bl_info = {
     "name": "Blender MCP",
     "author": "blender-open-mcp contributors",
-    "version": (4, 1, 0),
+    "version": (4, 2, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar > Blender MCP",
     "description": "MCP server add-on: control Blender via the Model Context Protocol",
@@ -60,6 +60,11 @@ MAIN_THREAD_PUMP_GRACE = 0.5
 _server_socket: Optional[socket.socket] = None
 _server_thread: Optional[threading.Thread] = None
 _server_running = False
+
+# Transaction state. Transactions use Blender's undo stack plus a hidden Scene
+# marker so rollback can walk back to the exact MCP boundary.
+_TRANSACTION_PROP = "_blender_mcp_transaction"
+_active_transaction_id: Optional[str] = None
 
 # ---------------------------------------------------------------------------
 # Main-thread job pump
@@ -1000,6 +1005,494 @@ def handle_gn_validate(params: Dict) -> Any:
         "invalid_links": invalid_links,
     }
 
+
+# ---------------------------------------------------------------------------
+# Generic node trees (Geometry / Material / World / Compositor)
+# ---------------------------------------------------------------------------
+
+_NODE_TREE_TYPES = {"GEOMETRY", "MATERIAL", "WORLD", "COMPOSITOR"}
+
+
+def _resolve_node_tree(tree_type: str, tree_name: str = "", create: bool = False):
+    kind = str(tree_type or "").upper()
+    if kind not in _NODE_TREE_TYPES:
+        raise ValueError(
+            f"Unknown tree_type '{tree_type}'. Valid: {sorted(_NODE_TREE_TYPES)}"
+        )
+
+    if kind == "GEOMETRY":
+        if not tree_name:
+            raise ValueError("tree_name is required for GEOMETRY.")
+        tree = bpy.data.node_groups.get(tree_name)
+        if tree is None and create:
+            tree = bpy.data.node_groups.new(name=tree_name, type="GeometryNodeTree")
+        if tree is None:
+            raise ValueError(f"Geometry node group '{tree_name}' not found.")
+        if getattr(tree, "bl_idname", "") != "GeometryNodeTree":
+            raise ValueError(f"'{tree_name}' is not a GeometryNodeTree.")
+        return tree, {"tree_type": kind, "owner": tree.name}
+
+    if kind == "MATERIAL":
+        if not tree_name:
+            raise ValueError("tree_name is required for MATERIAL.")
+        owner = bpy.data.materials.get(tree_name)
+        if owner is None and create:
+            owner = bpy.data.materials.new(name=tree_name)
+        if owner is None:
+            raise ValueError(f"Material '{tree_name}' not found.")
+        if not getattr(owner, "use_nodes", False):
+            if not create:
+                raise ValueError(
+                    f"Material '{tree_name}' does not have nodes enabled. "
+                    "Call blender_node_ensure_tree first."
+                )
+            owner.use_nodes = True
+        if owner.node_tree is None:
+            raise RuntimeError(f"Material '{tree_name}' has no node tree.")
+        return owner.node_tree, {"tree_type": kind, "owner": owner.name}
+
+    if kind == "WORLD":
+        owner = bpy.data.worlds.get(tree_name) if tree_name else bpy.context.scene.world
+        if owner is None and create:
+            name = tree_name or "World"
+            owner = bpy.data.worlds.new(name=name)
+            if bpy.context.scene.world is None:
+                bpy.context.scene.world = owner
+        if owner is None:
+            raise ValueError(
+                f"World '{tree_name}' not found." if tree_name else "Current scene has no World."
+            )
+        if not getattr(owner, "use_nodes", False):
+            if not create:
+                raise ValueError(
+                    f"World '{owner.name}' does not have nodes enabled. "
+                    "Call blender_node_ensure_tree first."
+                )
+            owner.use_nodes = True
+        if owner.node_tree is None:
+            raise RuntimeError(f"World '{owner.name}' has no node tree.")
+        return owner.node_tree, {"tree_type": kind, "owner": owner.name}
+
+    # COMPOSITOR
+    scene = bpy.data.scenes.get(tree_name) if tree_name else bpy.context.scene
+    if scene is None:
+        raise ValueError(
+            f"Scene '{tree_name}' not found." if tree_name else "Current scene not found."
+        )
+    if not getattr(scene, "use_nodes", False):
+        if not create:
+            raise ValueError(
+                f"Scene '{scene.name}' does not have compositor nodes enabled. "
+                "Call blender_node_ensure_tree first."
+            )
+        scene.use_nodes = True
+    if scene.node_tree is None:
+        raise RuntimeError(f"Scene '{scene.name}' has no compositor node tree.")
+    return scene.node_tree, {"tree_type": kind, "owner": scene.name}
+
+
+def _generic_node_tree_info(tree: Any, target: Dict[str, Any], include_sockets: bool = True):
+    nodes = [_node_info(node, include_sockets=include_sockets) for node in tree.nodes]
+    links = [
+        {
+            "from_node": link.from_node.name,
+            "from_socket": getattr(link.from_socket, "identifier", link.from_socket.name),
+            "to_node": link.to_node.name,
+            "to_socket": getattr(link.to_socket, "identifier", link.to_socket.name),
+            "is_valid": bool(getattr(link, "is_valid", True)),
+        }
+        for link in tree.links
+    ]
+    result = {
+        **target,
+        "node_tree": getattr(tree, "name", ""),
+        "node_tree_type": getattr(tree, "bl_idname", ""),
+        "node_count": len(nodes),
+        "link_count": len(links),
+        "nodes": nodes,
+        "links": links,
+    }
+    if target["tree_type"] == "GEOMETRY":
+        result["interface"] = [
+            _interface_socket_info(socket)
+            for socket in _geometry_interface_sockets(tree)
+        ]
+    return result
+
+
+def handle_node_ensure_tree(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=True,
+    )
+    return _generic_node_tree_info(tree, target, include_sockets=False)
+
+
+def handle_node_get_tree(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    return _generic_node_tree_info(
+        tree,
+        target,
+        include_sockets=bool(params.get("include_sockets", True)),
+    )
+
+
+def handle_node_add(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    node_type = params.get("node_type", "")
+    if not node_type:
+        raise ValueError("node_type is required.")
+    try:
+        node = tree.nodes.new(node_type)
+    except Exception as exc:
+        raise ValueError(f"Could not create node type '{node_type}': {exc}") from exc
+    if params.get("name"):
+        node.name = params["name"]
+    if params.get("label") is not None:
+        node.label = params["label"]
+    location = params.get("location")
+    if location is not None:
+        if not isinstance(location, (list, tuple)) or len(location) < 2:
+            raise ValueError("location must be [x, y].")
+        node.location = (float(location[0]), float(location[1]))
+    changed = _set_rna_properties(node, params.get("properties"))
+    return {**target, "node": _node_info(node), "properties": changed}
+
+
+def handle_node_remove(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found.")
+    tree.nodes.remove(node)
+    return {**target, "removed_node": node_name}
+
+
+def handle_node_connect(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    from_node = tree.nodes.get(params.get("from_node", ""))
+    to_node = tree.nodes.get(params.get("to_node", ""))
+    if from_node is None:
+        raise ValueError(f"Node '{params.get('from_node', '')}' not found.")
+    if to_node is None:
+        raise ValueError(f"Node '{params.get('to_node', '')}' not found.")
+    from_socket = _resolve_socket(from_node.outputs, params.get("from_socket"))
+    to_socket = _resolve_socket(to_node.inputs, params.get("to_socket"))
+
+    if bool(params.get("replace", True)) and not getattr(to_socket, "is_multi_input", False):
+        for link in list(tree.links):
+            if link.to_socket == to_socket:
+                tree.links.remove(link)
+
+    link = tree.links.new(from_socket, to_socket)
+    return {
+        **target,
+        "from": f"{from_node.name}.{from_socket.name}",
+        "to": f"{to_node.name}.{to_socket.name}",
+        "is_valid": bool(getattr(link, "is_valid", True)),
+    }
+
+
+def handle_node_disconnect(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    to_node = tree.nodes.get(params.get("to_node", ""))
+    if to_node is None:
+        raise ValueError(f"Node '{params.get('to_node', '')}' not found.")
+    to_socket = _resolve_socket(to_node.inputs, params.get("to_socket"))
+    from_node_name = params.get("from_node")
+    from_socket_selector = params.get("from_socket")
+    removed = []
+    for link in list(tree.links):
+        if link.to_socket != to_socket:
+            continue
+        if from_node_name and link.from_node.name != from_node_name:
+            continue
+        if from_socket_selector is not None:
+            expected = _resolve_socket(link.from_node.outputs, from_socket_selector)
+            if link.from_socket != expected:
+                continue
+        removed.append(
+            {
+                "from": f"{link.from_node.name}.{link.from_socket.name}",
+                "to": f"{link.to_node.name}.{link.to_socket.name}",
+            }
+        )
+        tree.links.remove(link)
+    return {**target, "removed_count": len(removed), "removed": removed}
+
+
+def handle_node_set_input(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found.")
+    socket = _resolve_socket(node.inputs, params.get("input_socket"))
+    if not hasattr(socket, "default_value"):
+        raise ValueError(
+            f"Input '{socket.name}' on '{node_name}' has no default_value."
+        )
+    value = _coerce_socket_value(socket, params.get("value"))
+    try:
+        socket.default_value = value
+    except Exception as exc:
+        raise ValueError(
+            f"Could not set {node_name}.{socket.name} to {params.get('value')!r}: {exc}"
+        ) from exc
+    return {
+        **target,
+        "node": node.name,
+        "input": socket.name,
+        "value": _json_safe_value(socket.default_value),
+    }
+
+
+def handle_node_set_property(params: Dict) -> Any:
+    tree, target = _resolve_node_tree(
+        params.get("tree_type", ""),
+        params.get("tree_name", ""),
+        create=False,
+    )
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found.")
+    property_name = params.get("property_name", "")
+    if not property_name:
+        raise ValueError("property_name is required.")
+    changed = _set_rna_properties(node, {property_name: params.get("value")})
+    return {**target, "node": node.name, "changed": changed}
+
+
+# ---------------------------------------------------------------------------
+# Undo / transaction primitives
+# ---------------------------------------------------------------------------
+
+def _undo_push(message: str) -> None:
+    try:
+        bpy.ops.ed.undo_push(message=message)
+    except Exception as exc:
+        raise RuntimeError(f"Could not push Blender undo state: {exc}") from exc
+
+
+def handle_undo(params: Dict) -> Any:
+    steps = max(1, min(int(params.get("steps", 1)), 50))
+    applied = 0
+    for _ in range(steps):
+        if hasattr(bpy.ops.ed.undo, "poll") and not bpy.ops.ed.undo.poll():
+            break
+        result = bpy.ops.ed.undo()
+        if "FINISHED" not in result:
+            break
+        applied += 1
+    return {"requested_steps": steps, "applied_steps": applied}
+
+
+def handle_redo(params: Dict) -> Any:
+    steps = max(1, min(int(params.get("steps", 1)), 50))
+    applied = 0
+    for _ in range(steps):
+        if hasattr(bpy.ops.ed.redo, "poll") and not bpy.ops.ed.redo.poll():
+            break
+        result = bpy.ops.ed.redo()
+        if "FINISHED" not in result:
+            break
+        applied += 1
+    return {"requested_steps": steps, "applied_steps": applied}
+
+
+def handle_transaction_begin(params: Dict) -> Any:
+    global _active_transaction_id
+    if _active_transaction_id is not None:
+        raise ValueError(
+            f"Transaction '{_active_transaction_id}' is already active. "
+            "Commit or roll it back first."
+        )
+    label = str(params.get("label") or "MCP transaction")
+    tx_id = f"mcp-tx-{time.time_ns()}"
+    scene = bpy.context.scene
+    scene[_TRANSACTION_PROP] = tx_id
+    _undo_push(f"MCP transaction start: {label}")
+    # This dirty marker is intentionally not pushed. Rollback walks the undo
+    # stack until the exact checkpoint value (tx_id) reappears.
+    scene[_TRANSACTION_PROP] = f"{tx_id}:active"
+    _active_transaction_id = tx_id
+    return {"transaction_id": tx_id, "label": label, "status": "active"}
+
+
+def handle_transaction_commit(params: Dict) -> Any:
+    global _active_transaction_id
+    tx_id = str(params.get("transaction_id", ""))
+    if not _active_transaction_id or tx_id != _active_transaction_id:
+        raise ValueError(
+            f"Transaction '{tx_id}' is not the active transaction "
+            f"('{_active_transaction_id}')."
+        )
+    scene = bpy.context.scene
+    try:
+        if _TRANSACTION_PROP in scene:
+            del scene[_TRANSACTION_PROP]
+    except Exception:
+        pass
+    _undo_push(f"MCP transaction commit: {tx_id}")
+    _active_transaction_id = None
+    return {"transaction_id": tx_id, "status": "committed"}
+
+
+def handle_transaction_rollback(params: Dict) -> Any:
+    global _active_transaction_id
+    tx_id = str(params.get("transaction_id", ""))
+    if not _active_transaction_id or tx_id != _active_transaction_id:
+        raise ValueError(
+            f"Transaction '{tx_id}' is not the active transaction "
+            f"('{_active_transaction_id}')."
+        )
+    max_steps = max(1, min(int(params.get("max_undo_steps", 100)), 500))
+    applied = 0
+    while applied < max_steps:
+        scene = bpy.context.scene
+        if scene.get(_TRANSACTION_PROP) == tx_id:
+            break
+        if hasattr(bpy.ops.ed.undo, "poll") and not bpy.ops.ed.undo.poll():
+            break
+        result = bpy.ops.ed.undo()
+        if "FINISHED" not in result:
+            break
+        applied += 1
+
+    scene = bpy.context.scene
+    if scene.get(_TRANSACTION_PROP) != tx_id:
+        raise RuntimeError(
+            f"Could not reach transaction checkpoint '{tx_id}' within "
+            f"{max_steps} undo steps."
+        )
+    try:
+        del scene[_TRANSACTION_PROP]
+    except Exception:
+        pass
+    _active_transaction_id = None
+    return {
+        "transaction_id": tx_id,
+        "status": "rolled_back",
+        "undo_steps": applied,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Viewport capture
+# ---------------------------------------------------------------------------
+
+def _find_view3d_context():
+    window_manager = getattr(bpy.context, "window_manager", None)
+    windows = getattr(window_manager, "windows", []) if window_manager else []
+    for window in windows:
+        screen = window.screen
+        for area in screen.areas:
+            if area.type != "VIEW_3D":
+                continue
+            region = next((r for r in area.regions if r.type == "WINDOW"), None)
+            if region is None:
+                continue
+            return window, screen, area, region, area.spaces.active
+    raise RuntimeError(
+        "No VIEW_3D area is available. Open a 3D Viewport before taking a screenshot."
+    )
+
+
+def handle_viewport_screenshot(params: Dict) -> Any:
+    width = max(64, min(int(params.get("width", 1024)), 4096))
+    height = max(64, min(int(params.get("height", 768)), 4096))
+    shading = str(params.get("shading", "SOLID")).upper()
+    valid_shading = {"WIREFRAME", "SOLID", "MATERIAL", "RENDERED"}
+    if shading not in valid_shading:
+        raise ValueError(f"shading must be one of {sorted(valid_shading)}.")
+
+    file_path = params.get("file_path")
+    if file_path:
+        try:
+            resolved_path = bpy.path.abspath(file_path)
+        except Exception:
+            resolved_path = os.path.abspath(str(file_path))
+    else:
+        resolved_path = os.path.join(bpy.app.tempdir, "blender_mcp_viewport.png")
+    resolved_path = os.path.abspath(str(resolved_path))
+    directory = os.path.dirname(resolved_path)
+    if directory:
+        os.makedirs(directory, exist_ok=True)
+
+    window, screen, area, region, space = _find_view3d_context()
+    scene = bpy.context.scene
+    old = {
+        "filepath": scene.render.filepath,
+        "resolution_x": scene.render.resolution_x,
+        "resolution_y": scene.render.resolution_y,
+        "resolution_percentage": scene.render.resolution_percentage,
+        "file_format": scene.render.image_settings.file_format,
+        "shading": space.shading.type,
+    }
+
+    try:
+        scene.render.filepath = resolved_path
+        scene.render.resolution_x = width
+        scene.render.resolution_y = height
+        scene.render.resolution_percentage = 100
+        scene.render.image_settings.file_format = "PNG"
+        space.shading.type = shading
+        with bpy.context.temp_override(
+            window=window,
+            screen=screen,
+            area=area,
+            region=region,
+            space_data=space,
+        ):
+            result = bpy.ops.render.opengl(write_still=True, view_context=True)
+        if "FINISHED" not in result:
+            raise RuntimeError(f"Viewport render did not finish: {result}")
+    finally:
+        scene.render.filepath = old["filepath"]
+        scene.render.resolution_x = old["resolution_x"]
+        scene.render.resolution_y = old["resolution_y"]
+        scene.render.resolution_percentage = old["resolution_percentage"]
+        scene.render.image_settings.file_format = old["file_format"]
+        space.shading.type = old["shading"]
+
+    exists = os.path.exists(resolved_path)
+    return {
+        "file_path": resolved_path,
+        "width": width,
+        "height": height,
+        "shading": shading,
+        "exists": exists,
+        "file_size": os.path.getsize(resolved_path) if exists else 0,
+    }
+
+
 def handle_set_material(params: Dict) -> Any:
     obj_name = params.get("object_name", "")
     mat_name = params.get("material_name", "")
@@ -1251,6 +1744,20 @@ HANDLERS = {
     "gn_set_node_property":     handle_gn_set_node_property,
     "gn_add_interface_socket":  handle_gn_add_interface_socket,
     "gn_validate":              handle_gn_validate,
+    "node_ensure_tree":         handle_node_ensure_tree,
+    "node_get_tree":            handle_node_get_tree,
+    "node_add":                 handle_node_add,
+    "node_remove":              handle_node_remove,
+    "node_connect":             handle_node_connect,
+    "node_disconnect":          handle_node_disconnect,
+    "node_set_input":           handle_node_set_input,
+    "node_set_property":        handle_node_set_property,
+    "undo":                     handle_undo,
+    "redo":                     handle_redo,
+    "transaction_begin":        handle_transaction_begin,
+    "transaction_commit":       handle_transaction_commit,
+    "transaction_rollback":     handle_transaction_rollback,
+    "viewport_screenshot":      handle_viewport_screenshot,
     "create_object":            handle_create_object,
     "modify_object":            handle_modify_object,
     "delete_object":            handle_delete_object,
@@ -1281,6 +1788,39 @@ WORKER_THREAD_COMMANDS = {
 }
 
 
+
+# Mutations get an explicit undo boundary because most handlers edit RNA
+# directly rather than running an UNDO-enabled Blender operator. This also
+# makes transaction rollback deterministic enough to walk back to its marker.
+UNDO_TRACKED_COMMANDS = {
+    "create_object",
+    "modify_object",
+    "delete_object",
+    "set_material",
+    "set_texture",
+    "add_modifier",
+    "set_modifier_properties",
+    "remove_modifier",
+    "gn_create_group",
+    "gn_add_node",
+    "gn_remove_node",
+    "gn_connect",
+    "gn_disconnect",
+    "gn_set_input",
+    "gn_set_modifier_input",
+    "gn_set_node_property",
+    "gn_add_interface_socket",
+    "node_ensure_tree",
+    "node_add",
+    "node_remove",
+    "node_connect",
+    "node_disconnect",
+    "node_set_input",
+    "node_set_property",
+    "execute_blender_code",
+}
+
+
 def _dispatch(command_type: str, params: Dict) -> bytes:
     """Route a command to its handler and return encoded response bytes."""
     handler = HANDLERS.get(command_type)
@@ -1293,7 +1833,12 @@ def _dispatch(command_type: str, params: Dict) -> bytes:
             result = handler(params)
         else:
             # bpy is not thread safe: run the handler on Blender's main thread.
-            result = _run_on_main_thread(lambda: handler(params))
+            def _execute_handler():
+                if command_type in UNDO_TRACKED_COMMANDS:
+                    _undo_push(f"MCP: {command_type}")
+                return handler(params)
+
+            result = _run_on_main_thread(_execute_handler)
         return _ok(result)
     except Exception as exc:
         tb = traceback.format_exc()
