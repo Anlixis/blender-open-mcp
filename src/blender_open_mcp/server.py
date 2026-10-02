@@ -92,9 +92,10 @@ mcp = FastMCP(
     instructions=(
         "Control a live Blender session through the Model Context Protocol and "
         "route natural-language prompts to any LLM backend (OpenAI-compatible, "
-        "Ollama, LM Studio, llama.cpp, Azure). Prefer typed scene, modifier, and "
-        "Geometry Nodes tools over blender_execute_code. Use blender_get_scene_info "
-        "and blender_get_selection to inspect context before editing."
+        "Ollama, LM Studio, llama.cpp, Azure). Prefer typed scene, modifier, "
+        "Geometry Nodes, and generic node tools over blender_execute_code. "
+        "Use blender_transaction_begin/commit/rollback for multi-step typed edits "
+        "and blender_viewport_screenshot for visual verification when useful."
     ),
 )
 
