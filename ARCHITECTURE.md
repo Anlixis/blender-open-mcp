@@ -59,10 +59,12 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 - If no live pump is detected (bpy mocked in unit tests, or `_server_loop`
   started directly), `_run_on_main_thread()` falls back to running inline rather
   than deadlocking.
-- `HANDLERS` currently includes: get_scene_info, get_object_info,
-  create_object, modify_object, delete_object, set_material, render_image,
-  execute_blender_code, get_polyhaven_categories, search_polyhaven_assets,
-  download_polyhaven_asset, set_texture, plus passthrough stubs
+- `HANDLERS` includes scene/object commands plus typed selection, modifier,
+  and Geometry Nodes operations: get_selection, get_modifiers, add/remove_modifier,
+  gn_create_group, gn_get_tree, gn_add/remove_node, gn_connect, gn_set_input,
+  gn_set_node_property, gn_add_interface_socket, and gn_validate. It also
+  includes materials/rendering, execute_blender_code, PolyHaven commands, and
+  passthrough stubs
   (set/get_llm_provider, get_ollama_models) that acknowledge the LLM config —
   the actual LLM state lives in the MCP server.
 
@@ -73,11 +75,18 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
   from a clean close; `ConnectionResetError` / `BrokenPipeError` surface as an
   actionable "Blender reset the connection" message instead of a raw traceback.
 - **Blender tools** forward to the add-on via `_send_blender_command()`:
-  - scene: `blender_get_scene_info`, `blender_get_object_info`
+  - scene/context: `blender_get_scene_info`, `blender_get_object_info`,
+    `blender_get_selection`
   - objects: `blender_create_object`, `blender_modify_object`,
     `blender_delete_object`
+  - modifiers: `blender_get_modifiers`, `blender_add_modifier`,
+    `blender_remove_modifier`
+  - Geometry Nodes: `blender_gn_create_group`, `blender_gn_get_tree`,
+    `blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
+    `blender_gn_set_input`, `blender_gn_set_node_property`,
+    `blender_gn_add_interface_socket`, `blender_gn_validate`
   - materials/render: `blender_set_material`, `blender_render_image`
-  - code: `blender_execute_code`
+  - code fallback: `blender_execute_code`
 - **PolyHaven tools** call `api.polyhaven.com` directly:
   `blender_get_polyhaven_categories`, `blender_search_polyhaven_assets`,
   `blender_download_polyhaven_asset`, `blender_set_texture`.
@@ -151,6 +160,18 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 3. `llm.chat()` resolves provider → URL → payload → headers, calls the
    endpoint, and normalizes the text reply.
 4. Any failure becomes an `Error: ...` string (never a stack trace).
+
+## Typed procedural editing
+
+Geometry Nodes are exposed as small, typed mutations rather than generated
+Python scripts. An agent can inspect a graph with `blender_gn_get_tree`, make
+one edit, validate with `blender_gn_validate`, and inspect again. Socket
+selectors accept names, identifiers, or indexes. This keeps tool calls compact,
+auditable, and easier for local models to recover from than a monolithic
+`blender_execute_code` call.
+
+`blender_execute_code` remains available as an advanced fallback for Blender
+operations not yet represented by typed tools.
 
 ## State management
 - `_llm_state` (server) — single source of truth for the active provider
