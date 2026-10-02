@@ -62,7 +62,8 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
 - `HANDLERS` includes scene/object commands plus typed selection, modifier,
   and Geometry Nodes operations: get_selection, get_modifiers, add/remove_modifier,
   gn_create_group, gn_get_tree, gn_add/remove_node, gn_connect, gn_set_input,
-  gn_set_node_property, gn_add_interface_socket, and gn_validate. It also
+  gn_set_modifier_input, gn_set_node_property, gn_add_interface_socket, and
+  gn_validate. It also
   includes materials/rendering, execute_blender_code, PolyHaven commands, and
   passthrough stubs
   (set/get_llm_provider, get_ollama_models) that acknowledge the LLM config —
@@ -80,11 +81,12 @@ _send_blender_command()      PROVIDERS registry + chat()/list_models()
   - objects: `blender_create_object`, `blender_modify_object`,
     `blender_delete_object`
   - modifiers: `blender_get_modifiers`, `blender_add_modifier`,
-    `blender_remove_modifier`
+    `blender_set_modifier_properties`, `blender_remove_modifier`
   - Geometry Nodes: `blender_gn_create_group`, `blender_gn_get_tree`,
     `blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
-    `blender_gn_set_input`, `blender_gn_set_node_property`,
-    `blender_gn_add_interface_socket`, `blender_gn_validate`
+    `blender_gn_set_input`, `blender_gn_set_modifier_input`,
+    `blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
+    `blender_gn_validate`
   - materials/render: `blender_set_material`, `blender_render_image`
   - code fallback: `blender_execute_code`
 - **PolyHaven tools** call `api.polyhaven.com` directly:
