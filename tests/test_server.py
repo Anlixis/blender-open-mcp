@@ -164,6 +164,13 @@ class TestToolAnnotations:
         names = [t.name for t in await mcp.list_tools()]
         for expected in [
             "blender_get_scene_info",
+            "blender_get_selection",
+            "blender_get_modifiers",
+            "blender_gn_create_group",
+            "blender_gn_get_tree",
+            "blender_gn_add_node",
+            "blender_gn_connect",
+            "blender_gn_validate",
             "blender_create_object",
             "blender_delete_object",
             "blender_ai_prompt",
