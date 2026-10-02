@@ -237,3 +237,30 @@ def test_gn_set_modifier_input_uses_interface_identifier():
     assert modifier["Socket_2"] == 12.0
     assert result["identifier"] == "Socket_2"
     obj.update_tag.assert_called_once()
+
+
+def test_gn_disconnect_removes_targeted_link():
+    source_socket = make_socket("Geometry", "source")
+    target_socket = make_socket("Geometry", "target")
+    source = make_node("Source", "GeometryNodeJoinGeometry", outputs=[source_socket])
+    target = make_node("Target", "NodeGroupOutput", inputs=[target_socket])
+    links = LinkCollection()
+    links.new(source_socket, target_socket)
+    tree = SimpleNamespace(
+        name="TestGN",
+        bl_idname="GeometryNodeTree",
+        nodes=NodeCollection([source, target]),
+        links=links,
+    )
+    install_tree(tree)
+
+    result = addon.handle_gn_disconnect(
+        {
+            "node_group": "TestGN",
+            "to_node": "Target",
+            "to_socket": "target",
+        }
+    )
+
+    assert result["removed_count"] == 1
+    assert links == []
