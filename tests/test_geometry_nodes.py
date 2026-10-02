@@ -193,3 +193,47 @@ def test_set_rna_properties_rejects_private_names():
         assert "not writable" in str(exc)
     else:
         raise AssertionError("Expected private property to be rejected")
+
+
+class FakeModifier(dict):
+    def __init__(self, name, node_group):
+        super().__init__()
+        self.name = name
+        self.type = "NODES"
+        self.node_group = node_group
+
+
+def test_gn_set_modifier_input_uses_interface_identifier():
+    interface_socket = SimpleNamespace(
+        item_type="SOCKET",
+        name="Density",
+        identifier="Socket_2",
+        in_out="INPUT",
+        bl_socket_idname="NodeSocketFloat",
+        default_value=1.0,
+    )
+    tree = SimpleNamespace(
+        name="TestGN",
+        bl_idname="GeometryNodeTree",
+        interface=SimpleNamespace(items_tree=[interface_socket]),
+    )
+    modifier = FakeModifier("GeometryNodes", tree)
+    modifiers = MagicMock()
+    modifiers.get.return_value = modifier
+    obj = SimpleNamespace(name="Cube", modifiers=modifiers, update_tag=MagicMock())
+    objects = MagicMock()
+    objects.get.return_value = obj
+    addon.bpy.data.objects = objects
+
+    result = addon.handle_gn_set_modifier_input(
+        {
+            "object_name": "Cube",
+            "modifier_name": "GeometryNodes",
+            "input_socket": "Density",
+            "value": 12.0,
+        }
+    )
+
+    assert modifier["Socket_2"] == 12.0
+    assert result["identifier"] == "Socket_2"
+    obj.update_tag.assert_called_once()
