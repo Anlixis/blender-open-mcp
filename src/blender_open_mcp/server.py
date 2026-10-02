@@ -29,7 +29,7 @@ import os
 import socket
 import sys
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import httpx
 from fastmcp import FastMCP
@@ -91,9 +91,9 @@ mcp = FastMCP(
     instructions=(
         "Control a live Blender session through the Model Context Protocol and "
         "route natural-language prompts to any LLM backend (OpenAI-compatible, "
-        "Ollama, LM Studio, llama.cpp, Azure). Use blender_get_scene_info first, "
-        "then blender_get_llm_provider / blender_set_llm_provider to configure "
-        "the AI backend."
+        "Ollama, LM Studio, llama.cpp, Azure). Prefer typed scene, modifier, and "
+        "Geometry Nodes tools over blender_execute_code. Use blender_get_scene_info "
+        "and blender_get_selection to inspect context before editing."
     ),
 )
 
@@ -114,18 +114,27 @@ def _send_blender_command(
         ValueError: if the response cannot be parsed.
     """
     payload = json.dumps({"type": command_type, "params": params or {}}) + "\n"
+    raw = ""
     try:
         with socket.create_connection(
             (BLENDER_HOST, BLENDER_PORT), timeout=BLENDER_TIMEOUT
         ) as sock:
             sock.sendall(payload.encode("utf-8"))
-            chunks: List[bytes] = []
-            while True:
+            # Responses are newline-terminated (see addon.py _ok/_err), so stop
+            # at the first "\n" instead of waiting for the peer to close. Waiting
+            # for EOF cannot tell a clean shutdown apart from a crash mid-reply.
+            buffer = bytearray()
+            while b"\n" not in buffer:
                 chunk = sock.recv(4096)
                 if not chunk:
-                    break
-                chunks.append(chunk)
-            raw = b"".join(chunks).decode("utf-8").strip()
+                    break  # peer closed; fall through with whatever arrived
+                buffer.extend(chunk)
+            raw = buffer.decode("utf-8").strip()
+        if not raw:
+            raise ValueError(
+                "Blender add-on closed the connection without sending a response. "
+                "Check Blender's system console for a traceback."
+            )
         response: Dict[str, Any] = json.loads(raw)
         return response
     except ConnectionRefusedError:
@@ -133,6 +142,13 @@ def _send_blender_command(
             f"Cannot connect to Blender add-on at {BLENDER_HOST}:{BLENDER_PORT}. "
             "Make sure Blender is open with the Blender MCP add-on enabled and the "
             "server started (N-key sidebar -> Blender MCP -> Start MCP Server)."
+        )
+    except (ConnectionResetError, BrokenPipeError) as exc:
+        raise ConnectionError(
+            f"Blender reset the connection while handling '{command_type}' "
+            f"({type(exc).__name__}). Blender may have crashed or become "
+            "unresponsive; check its system console and restart the MCP server "
+            "from the sidebar."
         )
     except socket.timeout:
         raise TimeoutError(
@@ -155,7 +171,8 @@ def _format_blender_result(response: Dict[str, Any]) -> str:
 
 def _handle_blender_error(exc: Exception) -> str:
     """Produce a friendly, actionable error string from common exceptions."""
-    if isinstance(exc, (ConnectionRefusedError, TimeoutError, ValueError)):
+    # ConnectionError covers refused/reset/broken-pipe alike.
+    if isinstance(exc, (ConnectionError, TimeoutError, ValueError)):
         return str(exc)
     return (
         f"Unexpected error communicating with Blender: {type(exc).__name__}: {exc}. "
@@ -439,6 +456,478 @@ async def blender_delete_object(name: str) -> str:
     try:
         return _format_blender_result(
             _send_blender_command("delete_object", {"name": name})
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+
+# ===========================================================================
+# MCP Tools — Selection, Modifiers & Geometry Nodes
+# ===========================================================================
+
+@mcp.tool(
+    name="blender_get_selection",
+    annotations={
+        "title": "Get Blender Selection",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_get_selection() -> str:
+    """Return the active object, selected objects, and current Blender mode."""
+    try:
+        return _format_blender_result(_send_blender_command("get_selection"))
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_get_modifiers",
+    annotations={
+        "title": "List Object Modifiers",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_get_modifiers(object_name: str) -> str:
+    """List modifiers on an object, including attached Geometry Nodes groups."""
+    try:
+        return _format_blender_result(
+            _send_blender_command("get_modifiers", {"object_name": object_name})
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_add_modifier",
+    annotations={
+        "title": "Add Object Modifier",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_add_modifier(
+    object_name: str,
+    modifier_type: str,
+    name: Optional[str] = None,
+    properties: Optional[Dict[str, Any]] = None,
+    node_group: Optional[str] = None,
+) -> str:
+    """Add a Blender modifier with optional RNA properties and node group."""
+    params: Dict[str, Any] = {
+        "object_name": object_name,
+        "modifier_type": modifier_type,
+    }
+    if name:
+        params["name"] = name
+    if properties:
+        params["properties"] = properties
+    if node_group:
+        params["node_group"] = node_group
+    try:
+        return _format_blender_result(_send_blender_command("add_modifier", params))
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_set_modifier_properties",
+    annotations={
+        "title": "Set Modifier Properties",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_set_modifier_properties(
+    object_name: str,
+    modifier_name: str,
+    properties: Dict[str, Any],
+) -> str:
+    """Update public RNA properties on an existing modifier."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "set_modifier_properties",
+                {
+                    "object_name": object_name,
+                    "modifier_name": modifier_name,
+                    "properties": properties,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_remove_modifier",
+    annotations={
+        "title": "Remove Object Modifier",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_remove_modifier(object_name: str, modifier_name: str) -> str:
+    """Remove a named modifier from an object."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "remove_modifier",
+                {"object_name": object_name, "modifier_name": modifier_name},
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_create_group",
+    annotations={
+        "title": "Create Geometry Nodes Group",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_create_group(
+    name: str,
+    object_name: Optional[str] = None,
+    modifier_name: Optional[str] = None,
+    create_geometry_interface: bool = True,
+) -> str:
+    """Create/reuse a Geometry Nodes group and optionally attach it to an object."""
+    params: Dict[str, Any] = {
+        "name": name,
+        "create_geometry_interface": create_geometry_interface,
+    }
+    if object_name:
+        params["object_name"] = object_name
+    if modifier_name:
+        params["modifier_name"] = modifier_name
+    try:
+        return _format_blender_result(_send_blender_command("gn_create_group", params))
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_get_tree",
+    annotations={
+        "title": "Inspect Geometry Nodes Tree",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_get_tree(
+    node_group: str,
+    include_sockets: bool = True,
+) -> str:
+    """Return nodes, links, and optionally socket/default-value data for a GN group."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_get_tree",
+                {"node_group": node_group, "include_sockets": include_sockets},
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_add_node",
+    annotations={
+        "title": "Add Geometry Node",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_add_node(
+    node_group: str,
+    node_type: str,
+    name: Optional[str] = None,
+    label: Optional[str] = None,
+    location: Optional[List[float]] = None,
+    properties: Optional[Dict[str, Any]] = None,
+) -> str:
+    """Add any Geometry Nodes node by Blender bl_idname."""
+    params: Dict[str, Any] = {
+        "node_group": node_group,
+        "node_type": node_type,
+    }
+    if name:
+        params["name"] = name
+    if label is not None:
+        params["label"] = label
+    if location is not None:
+        params["location"] = location
+    if properties:
+        params["properties"] = properties
+    try:
+        return _format_blender_result(_send_blender_command("gn_add_node", params))
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_remove_node",
+    annotations={
+        "title": "Remove Geometry Node",
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_remove_node(node_group: str, node_name: str) -> str:
+    """Remove a node from a Geometry Nodes group by exact node name."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_remove_node",
+                {"node_group": node_group, "node_name": node_name},
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_connect",
+    annotations={
+        "title": "Connect Geometry Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_connect(
+    node_group: str,
+    from_node: str,
+    from_socket: Union[str, int],
+    to_node: str,
+    to_socket: Union[str, int],
+    replace: bool = True,
+) -> str:
+    """Connect two Geometry Nodes sockets by name, identifier, or index."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_connect",
+                {
+                    "node_group": node_group,
+                    "from_node": from_node,
+                    "from_socket": from_socket,
+                    "to_node": to_node,
+                    "to_socket": to_socket,
+                    "replace": replace,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_disconnect",
+    annotations={
+        "title": "Disconnect Geometry Nodes",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_disconnect(
+    node_group: str,
+    to_node: str,
+    to_socket: Union[str, int],
+    from_node: Optional[str] = None,
+    from_socket: Optional[Union[str, int]] = None,
+) -> str:
+    """Remove links targeting a socket, optionally filtered by source."""
+    params: Dict[str, Any] = {
+        "node_group": node_group,
+        "to_node": to_node,
+        "to_socket": to_socket,
+    }
+    if from_node:
+        params["from_node"] = from_node
+    if from_socket is not None:
+        params["from_socket"] = from_socket
+    try:
+        return _format_blender_result(
+            _send_blender_command("gn_disconnect", params)
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_set_input",
+    annotations={
+        "title": "Set Geometry Node Input",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_set_input(
+    node_group: str,
+    node_name: str,
+    input_socket: Union[str, int],
+    value: Any,
+) -> str:
+    """Set an unlinked node input default value; object/material names are resolved."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_set_input",
+                {
+                    "node_group": node_group,
+                    "node_name": node_name,
+                    "input_socket": input_socket,
+                    "value": value,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_set_modifier_input",
+    annotations={
+        "title": "Set Geometry Nodes Modifier Input",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_set_modifier_input(
+    object_name: str,
+    modifier_name: str,
+    input_socket: str,
+    value: Any,
+) -> str:
+    """Set an exposed Geometry Nodes group input on an object's NODES modifier."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_set_modifier_input",
+                {
+                    "object_name": object_name,
+                    "modifier_name": modifier_name,
+                    "input_socket": input_socket,
+                    "value": value,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_set_node_property",
+    annotations={
+        "title": "Set Geometry Node Property",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_set_node_property(
+    node_group: str,
+    node_name: str,
+    property_name: str,
+    value: Any,
+) -> str:
+    """Set a public RNA property on a Geometry Nodes node."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_set_node_property",
+                {
+                    "node_group": node_group,
+                    "node_name": node_name,
+                    "property_name": property_name,
+                    "value": value,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_add_interface_socket",
+    annotations={
+        "title": "Add Geometry Nodes Interface Socket",
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": False,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_add_interface_socket(
+    node_group: str,
+    name: str,
+    in_out: str = "INPUT",
+    socket_type: str = "NodeSocketFloat",
+) -> str:
+    """Add an INPUT or OUTPUT socket to a Geometry Nodes group interface."""
+    try:
+        return _format_blender_result(
+            _send_blender_command(
+                "gn_add_interface_socket",
+                {
+                    "node_group": node_group,
+                    "name": name,
+                    "in_out": in_out,
+                    "socket_type": socket_type,
+                },
+            )
+        )
+    except Exception as exc:
+        return _handle_blender_error(exc)
+
+
+@mcp.tool(
+    name="blender_gn_validate",
+    annotations={
+        "title": "Validate Geometry Nodes Tree",
+        "readOnlyHint": True,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": False,
+    },
+)
+async def blender_gn_validate(node_group: str) -> str:
+    """Check a Geometry Nodes group for invalid links and return graph counts."""
+    try:
+        return _format_blender_result(
+            _send_blender_command("gn_validate", {"node_group": node_group})
         )
     except Exception as exc:
         return _handle_blender_error(exc)

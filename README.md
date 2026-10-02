@@ -117,9 +117,22 @@ Example Claude/Cursor-style config:
 ## Available MCP tools
 
 **Scene / object control** (forwarded to the Blender add-on over TCP):
-`blender_get_scene_info`, `blender_get_object_info`, `blender_create_object`,
-`blender_modify_object`, `blender_delete_object`, `blender_set_material`,
-`blender_render_image`, `blender_execute_code`.
+`blender_get_scene_info`, `blender_get_object_info`, `blender_get_selection`,
+`blender_create_object`, `blender_modify_object`, `blender_delete_object`,
+`blender_set_material`, `blender_render_image`, `blender_execute_code`.
+
+**Modifiers:** `blender_get_modifiers`, `blender_add_modifier`,
+`blender_set_modifier_properties`, `blender_remove_modifier`.
+
+**Geometry Nodes:** `blender_gn_create_group`, `blender_gn_get_tree`,
+`blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
+`blender_gn_disconnect`, `blender_gn_set_input`, `blender_gn_set_modifier_input`,
+`blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
+`blender_gn_validate`.
+
+The Geometry Nodes tools are intentionally typed and incremental: agents can
+inspect a graph, make a small edit, validate it, and inspect again instead of
+sending a large arbitrary Python script through `blender_execute_code`.
 
 **PolyHaven assets:** `blender_get_polyhaven_categories`,
 `blender_search_polyhaven_assets`, `blender_download_polyhaven_asset`,
@@ -139,9 +152,34 @@ Example Claude/Cursor-style config:
 **MCP Prompts** (`prompts/list` / `prompts/get`):
 - `blender_build_scene` – guided plan for building a scene from a description.
 - `blender_review_scene` – read-only inspection workflow.
+- `blender_build_geometry_nodes` – tool-first Geometry Nodes editing workflow.
 - `blender_configure_llm` – provider-switching instructions with examples.
 
 Prompts are registered in `src/blender_open_mcp/prompts.py`.
+
+
+### Geometry Nodes workflow
+
+For procedural modeling, prefer the typed tools over `blender_execute_code`:
+
+1. `blender_get_selection` and `blender_get_modifiers`
+2. `blender_gn_create_group` or `blender_gn_get_tree`
+3. `blender_gn_add_node`, `blender_gn_set_input`,
+   `blender_gn_set_node_property`, `blender_gn_connect`,
+   `blender_gn_disconnect`
+4. For exposed group controls, use `blender_gn_set_modifier_input`
+5. `blender_gn_validate`
+6. `blender_gn_get_tree` again to verify the final graph
+
+Sockets may be addressed by name, identifier, or zero-based index. Node types
+use Blender `bl_idname` values such as `GeometryNodeJoinGeometry` and
+`GeometryNodeInstanceOnPoints`.
+
+On Blender 5.2, exposed Geometry Nodes modifier inputs use the new RNA API
+(`modifier.properties.inputs.<identifier>.value`). The add-on detects this
+path automatically and falls back to legacy ID-properties for Blender 5.1 and
+earlier.
+
 
 ### Runtime provider switching (examples)
 
@@ -301,11 +339,21 @@ and the MCP client wire format, so they run without Blender or a live LLM.
   `blender_get_scene_info` and `blender_execute_code` round-trip over a real
   socket;
 - a parity test pins every bridge command to a registered addon handler and
-  every `blender_*` tool to a registered MCP tool.
+  every `blender_*` tool to a registered MCP tool;
+- `TestMainThreadDispatch` in `tests/test_addon.py` covers the add-on's
+  main-thread marshalling: bpy handlers run on the timer pump rather than the
+  connection thread, errors propagate back to the caller, network-only commands
+  stay on the worker thread, and a stopped pump releases blocked workers.
 
 ## Notes / known gaps
 
 - Tests exercise the server without a live Blender; run them against a real
   Blender session to validate `addon.py` end to end.
+- Blender API calls are executed on Blender's main thread via a
+  `bpy.app.timers` pump, so scene commands are serialised: a long render or a
+  heavy `blender_execute_code` build delays whatever is queued behind it.
+  PolyHaven downloads and LLM calls stay on worker threads and don't block the
+  UI. If Blender is busy with a modal operator, commands wait rather than
+  running against an invalid context.
 - See `ARCHITECTURE.md` for the component diagram and `AGENTS.md` for
   contributor conventions.

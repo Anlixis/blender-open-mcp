@@ -11,8 +11,9 @@ startup (CLI/env) and switched at runtime through MCP tools.
 - `addon.py` — single-file Blender add-on. Registers operators/panel, runs a
   TCP server (default `localhost:9876`) that receives newline-delimited JSON
   commands (`{"type": ..., "params": {...}}`) and dispatches to handlers in
-  `HANDLERS`. Handlers cover scene info, object create/modify/delete,
-  materials, rendering, code execution, and PolyHaven download/set-texture.
+  `HANDLERS`. Handlers cover scene info, selection, object CRUD, modifiers,
+  typed Geometry Nodes editing, materials, rendering, code execution, and
+  PolyHaven download/set-texture.
 - `src/blender_open_mcp/`
   - `server.py` — MCP server. Registers all `blender_*` tools with flat
     signatures, owns the Blender TCP bridge (`_send_blender_command`), the
@@ -47,6 +48,10 @@ startup (CLI/env) and switched at runtime through MCP tools.
   `blender_list_llm_models` lists models. Ollama-only aliases
   (`blender_set_ollama_model`, `blender_set_ollama_url`,
   `blender_get_ollama_models`) are thin wrappers for backward compatibility.
+- **Tool-first procedural editing.** Prefer `blender_gn_*` and modifier tools
+  over `blender_execute_code`. Geometry Nodes changes should be incremental:
+  inspect → edit → validate → inspect. Arbitrary Python remains an advanced
+  fallback for operations not covered by typed tools.
 - **Blender bridge protocol.** Server sends
   `{"type": "<handler>", "params": {...}}\n` over TCP and reads one JSON
   response line: `{"status":"ok","result":...}` or

@@ -69,6 +69,42 @@ def blender_review_scene() -> str:
     )
 
 
+
+@prompt(
+    name="blender_build_geometry_nodes",
+    title="Build or edit a Geometry Nodes graph",
+    description=(
+        "Render a safe tool-first workflow for inspecting, creating, and "
+        "validating Geometry Nodes without relying on arbitrary Python."
+    ),
+)
+def blender_build_geometry_nodes(object_name: str, description: str) -> str:
+    """Instructions for building Geometry Nodes on ``object_name``."""
+    return (
+        "You are editing Geometry Nodes through blender_open_mcp.\n\n"
+        f"Target object: {object_name}\n"
+        f"Requested procedural setup: {description}\n\n"
+        "Workflow:\n"
+        "1. Call blender_get_selection and blender_get_modifiers to confirm the "
+        "target object and existing modifier stack.\n"
+        "2. If a Geometry Nodes group already exists, inspect it with "
+        "blender_gn_get_tree before changing anything.\n"
+        "3. Otherwise create and attach a group with blender_gn_create_group.\n"
+        "4. Build the graph incrementally using blender_gn_add_node, "
+        "blender_gn_set_node_property, blender_gn_set_input, "
+        "blender_gn_connect, and blender_gn_disconnect. Use exact Blender "
+        "node bl_idnames.\n"
+        "5. Add exposed group inputs/outputs with blender_gn_add_interface_socket "
+        "when the user needs modifier-level controls, and set their per-object "
+        "values with blender_gn_set_modifier_input.\n"
+        "6. Call blender_gn_validate and then blender_gn_get_tree after meaningful "
+        "changes to verify the graph.\n"
+        "7. Prefer these typed tools over blender_execute_code. Use arbitrary "
+        "Python only when the requested operation cannot be expressed with the "
+        "Geometry Nodes tools.\n"
+    )
+
+
 @prompt(
     name="blender_configure_llm",
     title="Configure the LLM backend provider",
@@ -105,6 +141,7 @@ def register_prompts(mcp_server: FastMCP) -> None:
     """Register all prompt templates on a FastMCP instance."""
     mcp_server.add_prompt(blender_build_scene)
     mcp_server.add_prompt(blender_review_scene)
+    mcp_server.add_prompt(blender_build_geometry_nodes)
     mcp_server.add_prompt(blender_configure_llm)
 
 

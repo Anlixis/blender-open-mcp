@@ -16,7 +16,7 @@ Protocol (JSON over TCP, newline-terminated):
 bl_info = {
     "name": "Blender MCP",
     "author": "blender-open-mcp contributors",
-    "version": (4, 0, 0),
+    "version": (4, 1, 0),
     "blender": (3, 0, 0),
     "location": "3D Viewport > Sidebar > Blender MCP",
     "description": "MCP server add-on: control Blender via the Model Context Protocol",
@@ -27,11 +27,14 @@ import bpy
 import json
 import math
 import os
+import queue
 import socket
 import threading
+import time
 import traceback
 import urllib.request
-from typing import Any, Dict, Optional
+from types import SimpleNamespace
+from typing import Any, Callable, Dict, Optional
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +45,14 @@ DEFAULT_PORT = 9876
 SOCKET_TIMEOUT = 60.0
 RECV_BUFFER = 8192
 
+# How often the main-thread pump drains the job queue (seconds).
+MAIN_THREAD_POLL_INTERVAL = 0.05
+# How long a worker thread waits for a main-thread job before giving up.
+# Generous: a single render or heavy bpy build can legitimately take minutes.
+MAIN_THREAD_JOB_TIMEOUT = 600.0
+# Grace period for the pump to prove it is ticking after the server starts.
+MAIN_THREAD_PUMP_GRACE = 0.5
+
 
 # ---------------------------------------------------------------------------
 # Global server state
@@ -49,6 +60,23 @@ RECV_BUFFER = 8192
 _server_socket: Optional[socket.socket] = None
 _server_thread: Optional[threading.Thread] = None
 _server_running = False
+
+# ---------------------------------------------------------------------------
+# Main-thread job pump
+#
+# The TCP server accepts connections on daemon threads, but the Blender Python
+# API is not thread safe: bpy.ops.* in particular requires a valid window /
+# view-layer context that only exists on Blender's main thread. Calling it from
+# a worker thread yields a restricted context ("'Context' object has no
+# attribute 'active_object'") and can destabilise the process during renders.
+#
+# Worker threads therefore hand bpy work to _run_on_main_thread(), which queues
+# a job for a bpy.app.timers callback running on the main thread and blocks
+# until the result (or exception) comes back.
+# ---------------------------------------------------------------------------
+_main_thread_jobs: "queue.Queue[_MainThreadJob]" = queue.Queue()
+_pump_registered = False
+_pump_verified = False  # set True by the pump's first real tick
 
 
 # ---------------------------------------------------------------------------
@@ -67,6 +95,125 @@ def _vec3_from_list(lst, default=(0.0, 0.0, 0.0)):
     if lst and len(lst) >= 3:
         return tuple(float(v) for v in lst[:3])
     return default
+
+
+# ---------------------------------------------------------------------------
+# Main-thread execution
+# ---------------------------------------------------------------------------
+
+class _MainThreadJob:
+    """A callable queued for execution on Blender's main thread."""
+
+    __slots__ = ("fn", "done", "result", "error")
+
+    def __init__(self, fn: Callable[[], Any]):
+        self.fn = fn
+        self.done = threading.Event()
+        self.result: Any = None
+        self.error: Optional[BaseException] = None
+
+    def run(self) -> None:
+        try:
+            self.result = self.fn()
+        except BaseException as exc:  # noqa: BLE001 - relayed to the caller
+            self.error = exc
+        finally:
+            self.done.set()
+
+
+def _main_thread_pump() -> float:
+    """bpy.app.timers callback: drain queued jobs on Blender's main thread."""
+    global _pump_verified
+    _pump_verified = True
+    while True:
+        try:
+            job = _main_thread_jobs.get_nowait()
+        except queue.Empty:
+            break
+        job.run()
+    return MAIN_THREAD_POLL_INTERVAL
+
+
+def _start_main_thread_pump() -> None:
+    """Register the main-thread pump. Must be called from the main thread."""
+    global _pump_registered, _pump_verified
+    if _pump_registered:
+        return
+    _pump_verified = False
+    bpy.app.timers.register(_main_thread_pump, persistent=True)
+    _pump_registered = True
+
+
+def _stop_main_thread_pump() -> None:
+    """Unregister the pump and fail any jobs still waiting."""
+    global _pump_registered, _pump_verified
+    if _pump_registered:
+        try:
+            bpy.app.timers.unregister(_main_thread_pump)
+        except (ValueError, TypeError):
+            pass  # already gone
+        _pump_registered = False
+    _pump_verified = False
+    while True:
+        try:
+            job = _main_thread_jobs.get_nowait()
+        except queue.Empty:
+            break
+        job.error = RuntimeError("MCP server stopped before the job could run.")
+        job.done.set()
+
+
+def _pump_is_live() -> bool:
+    """True when a real bpy.app.timers pump is draining the queue.
+
+    Falls back to False when Blender's timer system isn't actually running
+    (unit tests with bpy mocked, or the server started without the operator),
+    so callers can execute inline instead of blocking forever.
+    """
+    if _pump_verified:
+        return True
+    if not _pump_registered:
+        return False
+    # Registered but not yet observed ticking: give it a moment to prove itself.
+    deadline = time.monotonic() + MAIN_THREAD_PUMP_GRACE
+    while time.monotonic() < deadline:
+        if _pump_verified:
+            return True
+        time.sleep(0.01)
+    return False
+
+
+def _run_on_main_thread(fn: Callable[[], Any]) -> Any:
+    """Run ``fn`` on Blender's main thread and return its result.
+
+    Exceptions raised by ``fn`` are re-raised in the calling thread.
+    """
+    if threading.current_thread() is threading.main_thread():
+        return fn()
+    if not _pump_is_live():
+        # No live pump: run inline rather than deadlock. Blender's own UI thread
+        # is not involved here, so this is the historical (unsafe) behaviour,
+        # kept only for headless/mocked contexts.
+        return fn()
+
+    job = _MainThreadJob(fn)
+    _main_thread_jobs.put(job)
+
+    # Wait in slices so a pump shut down after we enqueued doesn't strand us
+    # here for the full timeout.
+    deadline = time.monotonic() + MAIN_THREAD_JOB_TIMEOUT
+    while not job.done.wait(0.1):
+        if not _pump_registered:
+            raise RuntimeError("MCP server stopped before the job could run.")
+        if time.monotonic() >= deadline:
+            raise TimeoutError(
+                f"Blender did not execute the command within "
+                f"{MAIN_THREAD_JOB_TIMEOUT}s. The main thread may be blocked by a "
+                "modal operator or a long render."
+            )
+    if job.error is not None:
+        raise job.error
+    return job.result
 
 
 # ---------------------------------------------------------------------------
@@ -225,6 +372,634 @@ def handle_delete_object(params: Dict) -> Any:
     return {"deleted": name}
 
 
+
+# ---------------------------------------------------------------------------
+# Selection, modifiers, and Geometry Nodes
+# ---------------------------------------------------------------------------
+
+def _json_safe_value(value: Any) -> Any:
+    """Convert common Blender/RNA values into JSON-safe data."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {str(k): _json_safe_value(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_json_safe_value(v) for v in value]
+    if hasattr(value, "name") and isinstance(getattr(value, "name", None), str):
+        return {"name": value.name, "type": type(value).__name__}
+    try:
+        return [_json_safe_value(v) for v in value]
+    except (TypeError, AttributeError):
+        return str(value)
+
+
+def _set_rna_properties(target: Any, properties: Optional[Dict[str, Any]]) -> Dict[str, Any]:
+    """Set explicitly requested public RNA properties and report what changed."""
+    changed: Dict[str, Any] = {}
+    for key, value in (properties or {}).items():
+        if not key or key.startswith("_") or key in {"rna_type", "bl_rna"}:
+            raise ValueError(f"Property '{key}' is not writable through MCP.")
+        if not hasattr(target, key):
+            raise ValueError(
+                f"{type(target).__name__} has no property '{key}'."
+            )
+        try:
+            setattr(target, key, value)
+        except Exception as exc:
+            raise ValueError(
+                f"Could not set property '{key}' to {value!r}: {exc}"
+            ) from exc
+        changed[key] = _json_safe_value(getattr(target, key))
+    return changed
+
+
+def _modifier_info(mod: Any) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "name": mod.name,
+        "type": mod.type,
+        "show_viewport": bool(getattr(mod, "show_viewport", True)),
+        "show_render": bool(getattr(mod, "show_render", True)),
+    }
+    node_group = getattr(mod, "node_group", None)
+    if node_group is not None:
+        info["node_group"] = node_group.name
+    return info
+
+
+def _geometry_node_group(name: str):
+    if not name:
+        raise ValueError("node_group is required.")
+    tree = bpy.data.node_groups.get(name)
+    if tree is None:
+        raise ValueError(f"Geometry node group '{name}' not found.")
+    if getattr(tree, "bl_idname", "") != "GeometryNodeTree":
+        raise ValueError(
+            f"Node group '{name}' is '{getattr(tree, 'bl_idname', 'unknown')}', "
+            "not GeometryNodeTree."
+        )
+    return tree
+
+
+def _resolve_socket(sockets: Any, selector: Any):
+    """Resolve a node socket by name, identifier, or zero-based index."""
+    if isinstance(selector, int):
+        try:
+            return sockets[selector]
+        except (IndexError, TypeError):
+            raise ValueError(f"Socket index {selector} is out of range.")
+
+    key = str(selector)
+    socket = sockets.get(key) if hasattr(sockets, "get") else None
+    if socket is not None:
+        return socket
+    for candidate in sockets:
+        if getattr(candidate, "identifier", None) == key:
+            return candidate
+    raise ValueError(f"Socket '{selector}' not found.")
+
+
+def _socket_info(socket: Any) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "name": socket.name,
+        "identifier": getattr(socket, "identifier", socket.name),
+        "type": getattr(socket, "bl_idname", type(socket).__name__),
+        "enabled": bool(getattr(socket, "enabled", True)),
+        "is_linked": bool(getattr(socket, "is_linked", False)),
+    }
+    if hasattr(socket, "default_value"):
+        try:
+            info["default_value"] = _json_safe_value(socket.default_value)
+        except Exception:
+            pass
+    return info
+
+
+def _node_info(node: Any, include_sockets: bool = True) -> Dict[str, Any]:
+    info: Dict[str, Any] = {
+        "name": node.name,
+        "label": getattr(node, "label", ""),
+        "type": getattr(node, "bl_idname", type(node).__name__),
+        "location": list(getattr(node, "location", (0.0, 0.0))),
+        "hide": bool(getattr(node, "hide", False)),
+    }
+    if include_sockets:
+        info["inputs"] = [_socket_info(s) for s in node.inputs]
+        info["outputs"] = [_socket_info(s) for s in node.outputs]
+    return info
+
+
+def _interface_socket_info(socket: Any) -> Dict[str, Any]:
+    return {
+        "name": getattr(socket, "name", ""),
+        "identifier": getattr(socket, "identifier", getattr(socket, "name", "")),
+        "in_out": getattr(socket, "in_out", "INPUT"),
+        "socket_type": getattr(
+            socket,
+            "bl_socket_idname",
+            getattr(socket, "bl_idname", type(socket).__name__),
+        ),
+        "default_value": _json_safe_value(getattr(socket, "default_value", None)),
+    }
+
+
+def _geometry_interface_sockets(tree: Any):
+    if hasattr(tree, "interface") and hasattr(tree.interface, "items_tree"):
+        return [
+            item
+            for item in tree.interface.items_tree
+            if getattr(item, "item_type", None) == "SOCKET"
+        ]
+
+    # Blender 3.x compatibility: expose legacy tree.inputs/tree.outputs through
+    # lightweight proxies instead of trying to write an in_out attribute onto
+    # RNA socket objects.
+    legacy = []
+    for direction, sockets in (
+        ("INPUT", getattr(tree, "inputs", [])),
+        ("OUTPUT", getattr(tree, "outputs", [])),
+    ):
+        for socket in sockets:
+            legacy.append(
+                SimpleNamespace(
+                    name=getattr(socket, "name", ""),
+                    identifier=getattr(socket, "identifier", getattr(socket, "name", "")),
+                    in_out=direction,
+                    bl_socket_idname=getattr(
+                        socket,
+                        "bl_socket_idname",
+                        getattr(socket, "bl_idname", type(socket).__name__),
+                    ),
+                    default_value=getattr(socket, "default_value", None),
+                )
+            )
+    return legacy
+
+
+def _find_geometry_interface_socket(tree: Any, selector: str, in_out: str = "INPUT"):
+    direction = in_out.upper()
+    for socket in _geometry_interface_sockets(tree):
+        if getattr(socket, "in_out", direction) != direction:
+            continue
+        if selector in {
+            getattr(socket, "name", None),
+            getattr(socket, "identifier", None),
+        }:
+            return socket
+    raise ValueError(
+        f"Geometry Nodes {direction.lower()} interface socket '{selector}' not found."
+    )
+
+
+def _coerce_socket_value(socket: Any, value: Any) -> Any:
+    """Resolve string names for ID sockets; pass scalar/vector values through."""
+    socket_type = getattr(socket, "bl_idname", "")
+    if isinstance(value, str):
+        collections = {
+            "NodeSocketObject": getattr(bpy.data, "objects", None),
+            "NodeSocketCollection": getattr(bpy.data, "collections", None),
+            "NodeSocketMaterial": getattr(bpy.data, "materials", None),
+            "NodeSocketImage": getattr(bpy.data, "images", None),
+            "NodeSocketTexture": getattr(bpy.data, "textures", None),
+        }
+        collection = collections.get(socket_type)
+        if collection is not None:
+            resolved = collection.get(value)
+            if resolved is None:
+                raise ValueError(
+                    f"Could not resolve '{value}' for socket type {socket_type}."
+                )
+            return resolved
+    return value
+
+
+def handle_get_selection(_params: Dict) -> Any:
+    selected = list(getattr(bpy.context, "selected_objects", []) or [])
+    active = getattr(getattr(bpy.context, "view_layer", None), "objects", None)
+    active_obj = getattr(active, "active", None)
+    return {
+        "active": active_obj.name if active_obj else None,
+        "selected": [obj.name for obj in selected],
+        "mode": getattr(bpy.context, "mode", "OBJECT"),
+    }
+
+
+def handle_get_modifiers(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    return {
+        "object": object_name,
+        "modifiers": [_modifier_info(mod) for mod in obj.modifiers],
+    }
+
+
+def handle_add_modifier(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_type = str(params.get("modifier_type", "")).upper()
+    if not modifier_type:
+        raise ValueError("modifier_type is required.")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+
+    name = params.get("name") or modifier_type.title()
+    mod = obj.modifiers.new(name=name, type=modifier_type)
+    try:
+        changed = _set_rna_properties(mod, params.get("properties"))
+
+        node_group_name = params.get("node_group")
+        if node_group_name:
+            if modifier_type != "NODES":
+                raise ValueError("node_group can only be set on a NODES modifier.")
+            mod.node_group = _geometry_node_group(node_group_name)
+    except Exception:
+        obj.modifiers.remove(mod)
+        raise
+
+    return {
+        "object": object_name,
+        "modifier": _modifier_info(mod),
+        "properties": changed,
+    }
+
+
+def handle_set_modifier_properties(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_name = params.get("modifier_name", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' not found on object '{object_name}'."
+        )
+    changed = _set_rna_properties(mod, params.get("properties"))
+    return {
+        "object": object_name,
+        "modifier": _modifier_info(mod),
+        "properties": changed,
+    }
+
+
+def handle_remove_modifier(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_name = params.get("modifier_name", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' not found on object '{object_name}'."
+        )
+    obj.modifiers.remove(mod)
+    return {"object": object_name, "removed_modifier": modifier_name}
+
+
+def _new_geometry_interface_socket(tree: Any, name: str, in_out: str, socket_type: str):
+    """Blender 4.x+ node interface API with a Blender 3.x fallback."""
+    direction = in_out.upper()
+    if direction not in {"INPUT", "OUTPUT"}:
+        raise ValueError("in_out must be INPUT or OUTPUT.")
+    if hasattr(tree, "interface") and hasattr(tree.interface, "new_socket"):
+        return tree.interface.new_socket(
+            name=name,
+            in_out=direction,
+            socket_type=socket_type,
+        )
+    collection = tree.inputs if direction == "INPUT" else tree.outputs
+    return collection.new(socket_type, name)
+
+
+def handle_gn_create_group(params: Dict) -> Any:
+    name = params.get("name", "")
+    if not name:
+        raise ValueError("name is required.")
+
+    tree = bpy.data.node_groups.get(name)
+    created = tree is None
+    if tree is None:
+        tree = bpy.data.node_groups.new(name=name, type="GeometryNodeTree")
+    elif getattr(tree, "bl_idname", "") != "GeometryNodeTree":
+        raise ValueError(f"Existing node group '{name}' is not GeometryNodeTree.")
+
+    if created and params.get("create_geometry_interface", True):
+        _new_geometry_interface_socket(tree, "Geometry", "INPUT", "NodeSocketGeometry")
+        _new_geometry_interface_socket(tree, "Geometry", "OUTPUT", "NodeSocketGeometry")
+        input_node = tree.nodes.new("NodeGroupInput")
+        output_node = tree.nodes.new("NodeGroupOutput")
+        input_node.location = (-200.0, 0.0)
+        output_node.location = (200.0, 0.0)
+        source = input_node.outputs.get("Geometry")
+        target = output_node.inputs.get("Geometry")
+        if source is not None and target is not None:
+            tree.links.new(source, target)
+
+    attached = None
+    object_name = params.get("object_name")
+    if object_name:
+        obj = bpy.data.objects.get(object_name)
+        if obj is None:
+            raise ValueError(f"Object '{object_name}' not found.")
+        modifier_name = params.get("modifier_name") or name
+        mod = obj.modifiers.get(modifier_name)
+        if mod is None:
+            mod = obj.modifiers.new(name=modifier_name, type="NODES")
+        if mod.type != "NODES":
+            raise ValueError(
+                f"Modifier '{modifier_name}' on '{object_name}' is not NODES."
+            )
+        mod.node_group = tree
+        attached = {"object": object_name, "modifier": modifier_name}
+
+    return {
+        "node_group": tree.name,
+        "created": created,
+        "attached": attached,
+        "node_count": len(tree.nodes),
+        "link_count": len(tree.links),
+    }
+
+
+def handle_gn_get_tree(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    include_sockets = bool(params.get("include_sockets", True))
+    nodes = [_node_info(node, include_sockets=include_sockets) for node in tree.nodes]
+    links = []
+    for link in tree.links:
+        links.append({
+            "from_node": link.from_node.name,
+            "from_socket": getattr(link.from_socket, "identifier", link.from_socket.name),
+            "to_node": link.to_node.name,
+            "to_socket": getattr(link.to_socket, "identifier", link.to_socket.name),
+            "is_valid": bool(getattr(link, "is_valid", True)),
+        })
+    interface = [
+        _interface_socket_info(socket)
+        for socket in _geometry_interface_sockets(tree)
+    ]
+    return {
+        "node_group": tree.name,
+        "node_count": len(nodes),
+        "link_count": len(links),
+        "interface": interface,
+        "nodes": nodes,
+        "links": links,
+    }
+
+
+def handle_gn_add_node(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_type = params.get("node_type", "")
+    if not node_type:
+        raise ValueError("node_type is required.")
+    try:
+        node = tree.nodes.new(node_type)
+    except Exception as exc:
+        raise ValueError(f"Could not create node type '{node_type}': {exc}") from exc
+
+    if params.get("name"):
+        node.name = params["name"]
+    if params.get("label") is not None:
+        node.label = params["label"]
+    location = params.get("location")
+    if location is not None:
+        if not isinstance(location, (list, tuple)) or len(location) < 2:
+            raise ValueError("location must be [x, y].")
+        node.location = (float(location[0]), float(location[1]))
+    changed = _set_rna_properties(node, params.get("properties"))
+    return {
+        "node_group": tree.name,
+        "node": _node_info(node),
+        "properties": changed,
+    }
+
+
+def handle_gn_remove_node(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found in '{tree.name}'.")
+    tree.nodes.remove(node)
+    return {"node_group": tree.name, "removed_node": node_name}
+
+
+def handle_gn_connect(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    from_node_name = params.get("from_node", "")
+    to_node_name = params.get("to_node", "")
+    from_node = tree.nodes.get(from_node_name)
+    to_node = tree.nodes.get(to_node_name)
+    if from_node is None:
+        raise ValueError(f"Node '{from_node_name}' not found.")
+    if to_node is None:
+        raise ValueError(f"Node '{to_node_name}' not found.")
+
+    from_socket = _resolve_socket(from_node.outputs, params.get("from_socket"))
+    to_socket = _resolve_socket(to_node.inputs, params.get("to_socket"))
+
+    replace = bool(params.get("replace", True))
+    if replace and not getattr(to_socket, "is_multi_input", False):
+        for link in list(tree.links):
+            if link.to_socket == to_socket:
+                tree.links.remove(link)
+
+    link = tree.links.new(from_socket, to_socket)
+    return {
+        "node_group": tree.name,
+        "from": f"{from_node.name}.{from_socket.name}",
+        "to": f"{to_node.name}.{to_socket.name}",
+        "is_valid": bool(getattr(link, "is_valid", True)),
+    }
+
+
+def handle_gn_disconnect(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    to_node_name = params.get("to_node", "")
+    to_node = tree.nodes.get(to_node_name)
+    if to_node is None:
+        raise ValueError(f"Node '{to_node_name}' not found.")
+    to_socket = _resolve_socket(to_node.inputs, params.get("to_socket"))
+
+    from_node_name = params.get("from_node")
+    from_socket_selector = params.get("from_socket")
+    removed = []
+    for link in list(tree.links):
+        if link.to_socket != to_socket:
+            continue
+        if from_node_name and link.from_node.name != from_node_name:
+            continue
+        if from_socket_selector is not None:
+            expected = _resolve_socket(link.from_node.outputs, from_socket_selector)
+            if link.from_socket != expected:
+                continue
+        removed.append(
+            {
+                "from": f"{link.from_node.name}.{link.from_socket.name}",
+                "to": f"{link.to_node.name}.{link.to_socket.name}",
+            }
+        )
+        tree.links.remove(link)
+
+    return {
+        "node_group": tree.name,
+        "removed_count": len(removed),
+        "removed": removed,
+    }
+
+
+def handle_gn_set_input(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found in '{tree.name}'.")
+    socket = _resolve_socket(node.inputs, params.get("input_socket"))
+    if not hasattr(socket, "default_value"):
+        raise ValueError(
+            f"Input '{socket.name}' on '{node_name}' has no default_value."
+        )
+    value = _coerce_socket_value(socket, params.get("value"))
+    try:
+        socket.default_value = value
+    except Exception as exc:
+        raise ValueError(
+            f"Could not set {node_name}.{socket.name} to {params.get('value')!r}: {exc}"
+        ) from exc
+    return {
+        "node_group": tree.name,
+        "node": node.name,
+        "input": socket.name,
+        "value": _json_safe_value(socket.default_value),
+    }
+
+
+def handle_gn_set_modifier_input(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_name = params.get("modifier_name", "")
+    socket_selector = params.get("input_socket", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' not found on object '{object_name}'."
+        )
+    if mod.type != "NODES" or mod.node_group is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' on '{object_name}' is not a Geometry Nodes modifier."
+        )
+
+    socket = _find_geometry_interface_socket(
+        mod.node_group, str(socket_selector), "INPUT"
+    )
+    identifier = getattr(socket, "identifier", getattr(socket, "name", ""))
+    socket_type = getattr(
+        socket,
+        "bl_socket_idname",
+        getattr(socket, "bl_idname", ""),
+    )
+    proxy = SimpleNamespace(bl_idname=socket_type)
+    value = _coerce_socket_value(proxy, params.get("value"))
+
+    # Blender 5.2 moved Geometry Nodes modifier interface values from
+    # ID-properties (mod["Socket_2"]) to proper runtime RNA properties:
+    # mod.properties.inputs.Socket_2.value
+    # Keep the ID-property path as a fallback for Blender <= 5.1.
+    assigned_value = value
+    storage = "id_property"
+    try:
+        properties = getattr(mod, "properties", None)
+        inputs = getattr(properties, "inputs", None) if properties is not None else None
+        runtime_input = None
+        if inputs is not None:
+            runtime_input = getattr(inputs, identifier, None)
+            if runtime_input is None:
+                try:
+                    runtime_input = inputs[identifier]
+                except (AttributeError, IndexError, KeyError, TypeError):
+                    runtime_input = None
+
+        if runtime_input is not None and hasattr(runtime_input, "value"):
+            runtime_input.value = value
+            assigned_value = runtime_input.value
+            storage = "rna"
+        else:
+            mod[identifier] = value
+            assigned_value = mod[identifier]
+
+        # The RNA path normally triggers updates itself, but explicitly tag the
+        # object so both old and new Blender versions refresh the evaluated GN.
+        obj.update_tag()
+    except Exception as exc:
+        raise ValueError(
+            f"Could not set modifier input '{socket_selector}' ({identifier}) to "
+            f"{params.get('value')!r}: {exc}"
+        ) from exc
+    return {
+        "object": object_name,
+        "modifier": modifier_name,
+        "input": getattr(socket, "name", socket_selector),
+        "identifier": identifier,
+        "value": _json_safe_value(assigned_value),
+        "storage": storage,
+    }
+
+
+def handle_gn_set_node_property(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    node_name = params.get("node_name", "")
+    node = tree.nodes.get(node_name)
+    if node is None:
+        raise ValueError(f"Node '{node_name}' not found in '{tree.name}'.")
+    property_name = params.get("property_name", "")
+    if not property_name:
+        raise ValueError("property_name is required.")
+    changed = _set_rna_properties(node, {property_name: params.get("value")})
+    return {
+        "node_group": tree.name,
+        "node": node.name,
+        "changed": changed,
+    }
+
+
+def handle_gn_add_interface_socket(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    socket = _new_geometry_interface_socket(
+        tree,
+        params.get("name", ""),
+        params.get("in_out", "INPUT"),
+        params.get("socket_type", "NodeSocketFloat"),
+    )
+    return {
+        "node_group": tree.name,
+        "name": getattr(socket, "name", params.get("name", "")),
+        "in_out": params.get("in_out", "INPUT").upper(),
+        "socket_type": params.get("socket_type", "NodeSocketFloat"),
+    }
+
+
+def handle_gn_validate(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    invalid_links = []
+    for link in tree.links:
+        if not bool(getattr(link, "is_valid", True)):
+            invalid_links.append({
+                "from": f"{link.from_node.name}.{link.from_socket.name}",
+                "to": f"{link.to_node.name}.{link.to_socket.name}",
+            })
+    return {
+        "node_group": tree.name,
+        "valid": not invalid_links,
+        "node_count": len(tree.nodes),
+        "link_count": len(tree.links),
+        "invalid_links": invalid_links,
+    }
+
 def handle_set_material(params: Dict) -> Any:
     obj_name = params.get("object_name", "")
     mat_name = params.get("material_name", "")
@@ -365,23 +1140,27 @@ def handle_download_polyhaven_asset(params: Dict) -> Any:
     dest = os.path.join(tmp_dir, f"{asset_id}_{resolution}.{ext}")
     urllib.request.urlretrieve(download_url, dest)
 
-    # Import based on type
+    # Import based on type. The download above ran on the worker thread; the
+    # bpy work below must happen on Blender's main thread.
     if asset_type == "hdris":
-        world = bpy.context.scene.world
-        if world is None:
-            world = bpy.data.worlds.new("World")
-            bpy.context.scene.world = world
-        world.use_nodes = True
-        env_tex_node = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
-        env_tex_node.image = bpy.data.images.load(dest)
-        bg_node = (
-            world.node_tree.nodes.get("Background")
-            or world.node_tree.nodes.new("ShaderNodeBackground")
-        )
-        world.node_tree.links.new(
-            env_tex_node.outputs["Color"], bg_node.inputs["Color"]
-        )
-        return {"hdri_applied": asset_id, "file": dest, "world": world.name}
+        def _apply_hdri() -> Dict[str, Any]:
+            world = bpy.context.scene.world
+            if world is None:
+                world = bpy.data.worlds.new("World")
+                bpy.context.scene.world = world
+            world.use_nodes = True
+            env_tex_node = world.node_tree.nodes.new("ShaderNodeTexEnvironment")
+            env_tex_node.image = bpy.data.images.load(dest)
+            bg_node = (
+                world.node_tree.nodes.get("Background")
+                or world.node_tree.nodes.new("ShaderNodeBackground")
+            )
+            world.node_tree.links.new(
+                env_tex_node.outputs["Color"], bg_node.inputs["Color"]
+            )
+            return {"hdri_applied": asset_id, "file": dest, "world": world.name}
+
+        return _run_on_main_thread(_apply_hdri)
     else:
         return {
             "downloaded": asset_id,
@@ -456,6 +1235,22 @@ def handle_get_ollama_models(_params: Dict) -> Any:
 HANDLERS = {
     "get_scene_info":           handle_get_scene_info,
     "get_object_info":          handle_get_object_info,
+    "get_selection":            handle_get_selection,
+    "get_modifiers":            handle_get_modifiers,
+    "add_modifier":             handle_add_modifier,
+    "set_modifier_properties":  handle_set_modifier_properties,
+    "remove_modifier":          handle_remove_modifier,
+    "gn_create_group":          handle_gn_create_group,
+    "gn_get_tree":              handle_gn_get_tree,
+    "gn_add_node":              handle_gn_add_node,
+    "gn_remove_node":           handle_gn_remove_node,
+    "gn_connect":               handle_gn_connect,
+    "gn_disconnect":            handle_gn_disconnect,
+    "gn_set_input":             handle_gn_set_input,
+    "gn_set_modifier_input":    handle_gn_set_modifier_input,
+    "gn_set_node_property":     handle_gn_set_node_property,
+    "gn_add_interface_socket":  handle_gn_add_interface_socket,
+    "gn_validate":              handle_gn_validate,
     "create_object":            handle_create_object,
     "modify_object":            handle_modify_object,
     "delete_object":            handle_delete_object,
@@ -472,6 +1267,20 @@ HANDLERS = {
 }
 
 
+# Commands that never touch bpy: keep them on the worker thread so blocking
+# network I/O doesn't freeze Blender's UI. Everything else is marshalled to the
+# main thread. (download_polyhaven_asset is listed here because it downloads on
+# the worker thread and marshals only its bpy section - see the handler.)
+WORKER_THREAD_COMMANDS = {
+    "get_polyhaven_categories",
+    "search_polyhaven_assets",
+    "download_polyhaven_asset",
+    "set_llm_provider",
+    "get_llm_provider",
+    "get_ollama_models",
+}
+
+
 def _dispatch(command_type: str, params: Dict) -> bytes:
     """Route a command to its handler and return encoded response bytes."""
     handler = HANDLERS.get(command_type)
@@ -480,8 +1289,11 @@ def _dispatch(command_type: str, params: Dict) -> bytes:
             f"Unknown command '{command_type}'. Available: {list(HANDLERS)}"
         )
     try:
-        # Blender operators must run on the main thread; we use a modal timer
-        result = handler(params)
+        if command_type in WORKER_THREAD_COMMANDS:
+            result = handler(params)
+        else:
+            # bpy is not thread safe: run the handler on Blender's main thread.
+            result = _run_on_main_thread(lambda: handler(params))
         return _ok(result)
     except Exception as exc:
         tb = traceback.format_exc()
@@ -563,6 +1375,9 @@ class BLENDER_MCP_OT_StartServer(bpy.types.Operator):
             return {"CANCELLED"}
 
         prefs = context.scene.blender_mcp_props
+        # Start the main-thread pump before accepting connections, so the first
+        # command already has somewhere to hand its bpy work.
+        _start_main_thread_pump()
         _server_running = True
         _server_thread = threading.Thread(
             target=_server_loop,
@@ -592,6 +1407,7 @@ class BLENDER_MCP_OT_StopServer(bpy.types.Operator):
         if _server_thread:
             _server_thread.join(timeout=3.0)
             _server_thread = None
+        _stop_main_thread_pump()
         self.report({"INFO"}, "MCP server stopped.")
         return {"FINISHED"}
 
@@ -681,6 +1497,7 @@ def register():
 def unregister():
     global _server_running
     _server_running = False
+    _stop_main_thread_pump()
     for cls in reversed(CLASSES):
         bpy.utils.unregister_class(cls)
     del bpy.types.Scene.blender_mcp_props
