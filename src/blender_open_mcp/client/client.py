@@ -371,6 +371,26 @@ class BlenderMCPClient:
             },
         )
 
+    async def gn_disconnect(
+        self,
+        node_group: str,
+        to_node: str,
+        to_socket: Any,
+        from_node: Optional[str] = None,
+        from_socket: Any = None,
+    ) -> str:
+        """Disconnect Geometry Nodes links targeting an input socket."""
+        args: Dict[str, Any] = {
+            "node_group": node_group,
+            "to_node": to_node,
+            "to_socket": to_socket,
+        }
+        if from_node:
+            args["from_node"] = from_node
+        if from_socket is not None:
+            args["from_socket"] = from_socket
+        return await self.call_tool("blender_gn_disconnect", args)
+
     async def gn_set_input(
         self,
         node_group: str,
