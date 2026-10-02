@@ -33,6 +33,7 @@ import threading
 import time
 import traceback
 import urllib.request
+from types import SimpleNamespace
 from typing import Any, Callable, Dict, Optional
 
 
@@ -487,6 +488,60 @@ def _node_info(node: Any, include_sockets: bool = True) -> Dict[str, Any]:
     return info
 
 
+def _interface_socket_info(socket: Any) -> Dict[str, Any]:
+    return {
+        "name": getattr(socket, "name", ""),
+        "identifier": getattr(socket, "identifier", getattr(socket, "name", "")),
+        "in_out": getattr(socket, "in_out", "INPUT"),
+        "socket_type": getattr(
+            socket,
+            "bl_socket_idname",
+            getattr(socket, "bl_idname", type(socket).__name__),
+        ),
+        "default_value": _json_safe_value(getattr(socket, "default_value", None)),
+    }
+
+
+def _geometry_interface_sockets(tree: Any):
+    if hasattr(tree, "interface") and hasattr(tree.interface, "items_tree"):
+        return [
+            item
+            for item in tree.interface.items_tree
+            if getattr(item, "item_type", None) == "SOCKET"
+        ]
+    legacy = []
+    for socket in getattr(tree, "inputs", []):
+        if not hasattr(socket, "in_out"):
+            try:
+                socket.in_out = "INPUT"
+            except Exception:
+                pass
+        legacy.append(socket)
+    for socket in getattr(tree, "outputs", []):
+        if not hasattr(socket, "in_out"):
+            try:
+                socket.in_out = "OUTPUT"
+            except Exception:
+                pass
+        legacy.append(socket)
+    return legacy
+
+
+def _find_geometry_interface_socket(tree: Any, selector: str, in_out: str = "INPUT"):
+    direction = in_out.upper()
+    for socket in _geometry_interface_sockets(tree):
+        if getattr(socket, "in_out", direction) != direction:
+            continue
+        if selector in {
+            getattr(socket, "name", None),
+            getattr(socket, "identifier", None),
+        }:
+            return socket
+    raise ValueError(
+        f"Geometry Nodes {direction.lower()} interface socket '{selector}' not found."
+    )
+
+
 def _coerce_socket_value(socket: Any, value: Any) -> Any:
     """Resolve string names for ID sockets; pass scalar/vector values through."""
     socket_type = getattr(socket, "bl_idname", "")
@@ -542,14 +597,37 @@ def handle_add_modifier(params: Dict) -> Any:
 
     name = params.get("name") or modifier_type.title()
     mod = obj.modifiers.new(name=name, type=modifier_type)
+    try:
+        changed = _set_rna_properties(mod, params.get("properties"))
+
+        node_group_name = params.get("node_group")
+        if node_group_name:
+            if modifier_type != "NODES":
+                raise ValueError("node_group can only be set on a NODES modifier.")
+            mod.node_group = _geometry_node_group(node_group_name)
+    except Exception:
+        obj.modifiers.remove(mod)
+        raise
+
+    return {
+        "object": object_name,
+        "modifier": _modifier_info(mod),
+        "properties": changed,
+    }
+
+
+def handle_set_modifier_properties(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_name = params.get("modifier_name", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' not found on object '{object_name}'."
+        )
     changed = _set_rna_properties(mod, params.get("properties"))
-
-    node_group_name = params.get("node_group")
-    if node_group_name:
-        if modifier_type != "NODES":
-            raise ValueError("node_group can only be set on a NODES modifier.")
-        mod.node_group = _geometry_node_group(node_group_name)
-
     return {
         "object": object_name,
         "modifier": _modifier_info(mod),
@@ -650,10 +728,15 @@ def handle_gn_get_tree(params: Dict) -> Any:
             "to_socket": getattr(link.to_socket, "identifier", link.to_socket.name),
             "is_valid": bool(getattr(link, "is_valid", True)),
         })
+    interface = [
+        _interface_socket_info(socket)
+        for socket in _geometry_interface_sockets(tree)
+    ]
     return {
         "node_group": tree.name,
         "node_count": len(nodes),
         "link_count": len(links),
+        "interface": interface,
         "nodes": nodes,
         "links": links,
     }
@@ -748,6 +831,51 @@ def handle_gn_set_input(params: Dict) -> Any:
         "node": node.name,
         "input": socket.name,
         "value": _json_safe_value(socket.default_value),
+    }
+
+
+def handle_gn_set_modifier_input(params: Dict) -> Any:
+    object_name = params.get("object_name", "")
+    modifier_name = params.get("modifier_name", "")
+    socket_selector = params.get("input_socket", "")
+    obj = bpy.data.objects.get(object_name)
+    if obj is None:
+        raise ValueError(f"Object '{object_name}' not found.")
+    mod = obj.modifiers.get(modifier_name)
+    if mod is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' not found on object '{object_name}'."
+        )
+    if mod.type != "NODES" or mod.node_group is None:
+        raise ValueError(
+            f"Modifier '{modifier_name}' on '{object_name}' is not a Geometry Nodes modifier."
+        )
+
+    socket = _find_geometry_interface_socket(
+        mod.node_group, str(socket_selector), "INPUT"
+    )
+    identifier = getattr(socket, "identifier", getattr(socket, "name", ""))
+    socket_type = getattr(
+        socket,
+        "bl_socket_idname",
+        getattr(socket, "bl_idname", ""),
+    )
+    proxy = SimpleNamespace(bl_idname=socket_type)
+    value = _coerce_socket_value(proxy, params.get("value"))
+    try:
+        mod[identifier] = value
+        obj.update_tag()
+    except Exception as exc:
+        raise ValueError(
+            f"Could not set modifier input '{socket_selector}' to "
+            f"{params.get('value')!r}: {exc}"
+        ) from exc
+    return {
+        "object": object_name,
+        "modifier": modifier_name,
+        "input": getattr(socket, "name", socket_selector),
+        "identifier": identifier,
+        "value": _json_safe_value(value),
     }
 
 
@@ -1039,6 +1167,7 @@ HANDLERS = {
     "get_selection":            handle_get_selection,
     "get_modifiers":            handle_get_modifiers,
     "add_modifier":             handle_add_modifier,
+    "set_modifier_properties":  handle_set_modifier_properties,
     "remove_modifier":          handle_remove_modifier,
     "gn_create_group":          handle_gn_create_group,
     "gn_get_tree":              handle_gn_get_tree,
@@ -1046,6 +1175,7 @@ HANDLERS = {
     "gn_remove_node":           handle_gn_remove_node,
     "gn_connect":               handle_gn_connect,
     "gn_set_input":             handle_gn_set_input,
+    "gn_set_modifier_input":    handle_gn_set_modifier_input,
     "gn_set_node_property":     handle_gn_set_node_property,
     "gn_add_interface_socket":  handle_gn_add_interface_socket,
     "gn_validate":              handle_gn_validate,
