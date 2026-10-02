@@ -122,12 +122,13 @@ Example Claude/Cursor-style config:
 `blender_set_material`, `blender_render_image`, `blender_execute_code`.
 
 **Modifiers:** `blender_get_modifiers`, `blender_add_modifier`,
-`blender_remove_modifier`.
+`blender_set_modifier_properties`, `blender_remove_modifier`.
 
 **Geometry Nodes:** `blender_gn_create_group`, `blender_gn_get_tree`,
 `blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
-`blender_gn_set_input`, `blender_gn_set_node_property`,
-`blender_gn_add_interface_socket`, `blender_gn_validate`.
+`blender_gn_set_input`, `blender_gn_set_modifier_input`,
+`blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
+`blender_gn_validate`.
 
 The Geometry Nodes tools are intentionally typed and incremental: agents can
 inspect a graph, make a small edit, validate it, and inspect again instead of
@@ -165,8 +166,9 @@ For procedural modeling, prefer the typed tools over `blender_execute_code`:
 2. `blender_gn_create_group` or `blender_gn_get_tree`
 3. `blender_gn_add_node`, `blender_gn_set_input`,
    `blender_gn_set_node_property`, `blender_gn_connect`
-4. `blender_gn_validate`
-5. `blender_gn_get_tree` again to verify the final graph
+4. For exposed group controls, use `blender_gn_set_modifier_input`
+5. `blender_gn_validate`
+6. `blender_gn_get_tree` again to verify the final graph
 
 Sockets may be addressed by name, identifier, or zero-based index. Node types
 use Blender `bl_idname` values such as `GeometryNodeJoinGeometry` and
