@@ -126,7 +126,7 @@ Example Claude/Cursor-style config:
 
 **Geometry Nodes:** `blender_gn_create_group`, `blender_gn_get_tree`,
 `blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
-`blender_gn_set_input`, `blender_gn_set_modifier_input`,
+`blender_gn_disconnect`, `blender_gn_set_input`, `blender_gn_set_modifier_input`,
 `blender_gn_set_node_property`, `blender_gn_add_interface_socket`,
 `blender_gn_validate`.
 
@@ -165,7 +165,8 @@ For procedural modeling, prefer the typed tools over `blender_execute_code`:
 1. `blender_get_selection` and `blender_get_modifiers`
 2. `blender_gn_create_group` or `blender_gn_get_tree`
 3. `blender_gn_add_node`, `blender_gn_set_input`,
-   `blender_gn_set_node_property`, `blender_gn_connect`
+   `blender_gn_set_node_property`, `blender_gn_connect`,
+   `blender_gn_disconnect`
 4. For exposed group controls, use `blender_gn_set_modifier_input`
 5. `blender_gn_validate`
 6. `blender_gn_get_tree` again to verify the final graph
