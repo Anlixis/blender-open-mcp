@@ -117,9 +117,21 @@ Example Claude/Cursor-style config:
 ## Available MCP tools
 
 **Scene / object control** (forwarded to the Blender add-on over TCP):
-`blender_get_scene_info`, `blender_get_object_info`, `blender_create_object`,
-`blender_modify_object`, `blender_delete_object`, `blender_set_material`,
-`blender_render_image`, `blender_execute_code`.
+`blender_get_scene_info`, `blender_get_object_info`, `blender_get_selection`,
+`blender_create_object`, `blender_modify_object`, `blender_delete_object`,
+`blender_set_material`, `blender_render_image`, `blender_execute_code`.
+
+**Modifiers:** `blender_get_modifiers`, `blender_add_modifier`,
+`blender_remove_modifier`.
+
+**Geometry Nodes:** `blender_gn_create_group`, `blender_gn_get_tree`,
+`blender_gn_add_node`, `blender_gn_remove_node`, `blender_gn_connect`,
+`blender_gn_set_input`, `blender_gn_set_node_property`,
+`blender_gn_add_interface_socket`, `blender_gn_validate`.
+
+The Geometry Nodes tools are intentionally typed and incremental: agents can
+inspect a graph, make a small edit, validate it, and inspect again instead of
+sending a large arbitrary Python script through `blender_execute_code`.
 
 **PolyHaven assets:** `blender_get_polyhaven_categories`,
 `blender_search_polyhaven_assets`, `blender_download_polyhaven_asset`,
@@ -139,9 +151,27 @@ Example Claude/Cursor-style config:
 **MCP Prompts** (`prompts/list` / `prompts/get`):
 - `blender_build_scene` – guided plan for building a scene from a description.
 - `blender_review_scene` – read-only inspection workflow.
+- `blender_build_geometry_nodes` – tool-first Geometry Nodes editing workflow.
 - `blender_configure_llm` – provider-switching instructions with examples.
 
 Prompts are registered in `src/blender_open_mcp/prompts.py`.
+
+
+### Geometry Nodes workflow
+
+For procedural modeling, prefer the typed tools over `blender_execute_code`:
+
+1. `blender_get_selection` and `blender_get_modifiers`
+2. `blender_gn_create_group` or `blender_gn_get_tree`
+3. `blender_gn_add_node`, `blender_gn_set_input`,
+   `blender_gn_set_node_property`, `blender_gn_connect`
+4. `blender_gn_validate`
+5. `blender_gn_get_tree` again to verify the final graph
+
+Sockets may be addressed by name, identifier, or zero-based index. Node types
+use Blender `bl_idname` values such as `GeometryNodeJoinGeometry` and
+`GeometryNodeInstanceOnPoints`.
+
 
 ### Runtime provider switching (examples)
 
