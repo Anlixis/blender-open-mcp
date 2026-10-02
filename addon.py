@@ -816,6 +816,41 @@ def handle_gn_connect(params: Dict) -> Any:
     }
 
 
+def handle_gn_disconnect(params: Dict) -> Any:
+    tree = _geometry_node_group(params.get("node_group", ""))
+    to_node_name = params.get("to_node", "")
+    to_node = tree.nodes.get(to_node_name)
+    if to_node is None:
+        raise ValueError(f"Node '{to_node_name}' not found.")
+    to_socket = _resolve_socket(to_node.inputs, params.get("to_socket"))
+
+    from_node_name = params.get("from_node")
+    from_socket_selector = params.get("from_socket")
+    removed = []
+    for link in list(tree.links):
+        if link.to_socket != to_socket:
+            continue
+        if from_node_name and link.from_node.name != from_node_name:
+            continue
+        if from_socket_selector is not None:
+            expected = _resolve_socket(link.from_node.outputs, from_socket_selector)
+            if link.from_socket != expected:
+                continue
+        removed.append(
+            {
+                "from": f"{link.from_node.name}.{link.from_socket.name}",
+                "to": f"{link.to_node.name}.{link.to_socket.name}",
+            }
+        )
+        tree.links.remove(link)
+
+    return {
+        "node_group": tree.name,
+        "removed_count": len(removed),
+        "removed": removed,
+    }
+
+
 def handle_gn_set_input(params: Dict) -> Any:
     tree = _geometry_node_group(params.get("node_group", ""))
     node_name = params.get("node_name", "")
@@ -1182,6 +1217,7 @@ HANDLERS = {
     "gn_add_node":              handle_gn_add_node,
     "gn_remove_node":           handle_gn_remove_node,
     "gn_connect":               handle_gn_connect,
+    "gn_disconnect":            handle_gn_disconnect,
     "gn_set_input":             handle_gn_set_input,
     "gn_set_modifier_input":    handle_gn_set_modifier_input,
     "gn_set_node_property":     handle_gn_set_node_property,
