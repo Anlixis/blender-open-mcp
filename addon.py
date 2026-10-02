@@ -509,21 +509,29 @@ def _geometry_interface_sockets(tree: Any):
             for item in tree.interface.items_tree
             if getattr(item, "item_type", None) == "SOCKET"
         ]
+
+    # Blender 3.x compatibility: expose legacy tree.inputs/tree.outputs through
+    # lightweight proxies instead of trying to write an in_out attribute onto
+    # RNA socket objects.
     legacy = []
-    for socket in getattr(tree, "inputs", []):
-        if not hasattr(socket, "in_out"):
-            try:
-                socket.in_out = "INPUT"
-            except Exception:
-                pass
-        legacy.append(socket)
-    for socket in getattr(tree, "outputs", []):
-        if not hasattr(socket, "in_out"):
-            try:
-                socket.in_out = "OUTPUT"
-            except Exception:
-                pass
-        legacy.append(socket)
+    for direction, sockets in (
+        ("INPUT", getattr(tree, "inputs", [])),
+        ("OUTPUT", getattr(tree, "outputs", [])),
+    ):
+        for socket in sockets:
+            legacy.append(
+                SimpleNamespace(
+                    name=getattr(socket, "name", ""),
+                    identifier=getattr(socket, "identifier", getattr(socket, "name", "")),
+                    in_out=direction,
+                    bl_socket_idname=getattr(
+                        socket,
+                        "bl_socket_idname",
+                        getattr(socket, "bl_idname", type(socket).__name__),
+                    ),
+                    default_value=getattr(socket, "default_value", None),
+                )
+            )
     return legacy
 
 
